@@ -11,7 +11,14 @@
   "action": {
     "default_popup": "popup.html",
     "default_title": "Requests"
-  }
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://copilot.microsoft.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
 }
 
 
