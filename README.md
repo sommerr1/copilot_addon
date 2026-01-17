@@ -1,4 +1,4 @@
-# Copilot Addon
+# Copilot Addo
 
 Chrome extension for monitoring and viewing network requests from Microsoft Copilot API.
 
@@ -38,5 +38,4 @@ This extension requires the following permissions:
 - `webRequest` - To monitor network requests
 - `storage` - To store request data
 - `debugger` - To capture response bodies
-- `windows` - To access window information
-
+- `windows` - To access window informationfsdf

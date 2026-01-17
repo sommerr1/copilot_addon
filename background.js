@@ -15,6 +15,7 @@ function shouldStoreRequest(url) {
   // Normalize URL for comparison - handle both absolute and relative URLs
   const normalizedUrl = url.toLowerCase().trim();
   const filterPattern = "/c/api/conversations";
+  const historyPattern = "history?api-version=2";
   
   // Check if URL contains the filter pattern (works for both absolute and relative URLs)
   // This matches URLs like:
@@ -22,6 +23,11 @@ function shouldStoreRequest(url) {
   // - /c/api/conversations?types=...
   // - copilot.microsoft.com/c/api/conversations?types=...
   if (normalizedUrl.includes(filterPattern)) {
+    return true;
+  }
+  
+  // Check for history API requests
+  if (normalizedUrl.includes(historyPattern)) {
     return true;
   }
   
