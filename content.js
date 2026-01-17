@@ -1,5 +1,73 @@
 // Content script для извлечения информации об аккаунте из попапа Copilot
 
+function convertHtmlToPlainText(html) {
+    // 1. Создаём DOM
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, "text/html");
+
+    // 2. Удаляем элементы, которые точно не нужны
+    const selectorsToRemove = [
+        "img",
+        "[aria-label]",
+        ".sr-only",
+        "[data-testid='sticky-header']",
+        "[data-testid='date-divider']",
+        "svg",
+        "button",
+        "nav",
+        "header",
+        "footer"
+    ];
+    selectorsToRemove.forEach(sel => {
+        doc.querySelectorAll(sel).forEach(el => el.remove());
+    });
+
+    // 3. Теги, из которых извлекаем текст
+    const allowedTags = [
+        "p", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+        "code", "pre", "td", "th"
+    ];
+
+    let fragments = [];
+
+    allowedTags.forEach(tag => {
+        doc.querySelectorAll(tag).forEach(el => {
+            let text = el.textContent || "";
+
+            // 4. Удаляем эмодзи
+            text = text.replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, "");
+
+            // 5. Нормализуем пробелы
+            text = text.replace(/\s+/g, " ").trim();
+
+            if (text.length < 2) return;
+
+            // 6. Разбиваем на предложения
+            const sentences = splitIntoSentences(text);
+
+            // 7. Добавляем предложения в общий массив
+            sentences.forEach(s => {
+                if (s.length > 1) fragments.push(s);
+            });
+        });
+    });
+
+    // 8. Удаляем дубликаты
+    fragments = [...new Set(fragments)];
+
+    return fragments;
+}
+
+// --- Вспомогательная функция разбиения на предложения ---
+function splitIntoSentences(text) {
+    // Разбиваем по . ! ? с учётом кириллицы и латиницы
+    const raw = text.split(/(?<=[.!?])\s+/g);
+
+    return raw
+        .map(s => s.trim())
+        .filter(s => s.length > 1);
+}
+
 // Функция для поиска email в DOM
 function findEmailInDOM() {
   const emailPattern = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/;
