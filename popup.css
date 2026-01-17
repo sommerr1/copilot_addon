@@ -1,0 +1,147 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", Arial, sans-serif;
+  width: 420px;
+  color: #1c1c1c;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid #e6e6e6;
+  background: #fafafa;
+}
+
+.toolbar__title {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.toolbar__btn {
+  border: 1px solid #c7c7c7;
+  background: #fff;
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.requests {
+  max-height: 240px;
+  overflow: auto;
+  border-bottom: 1px solid #e6e6e6;
+}
+
+.request-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.request-item {
+  padding: 8px 12px;
+  border-bottom: 1px solid #f0f0f0;
+  cursor: pointer;
+}
+
+.request-item--active {
+  background: #f2f6ff;
+}
+
+.request-item__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.request-item__url {
+  font-size: 12px;
+  color: #2b2b2b;
+  word-break: break-all;
+  flex: 1;
+}
+
+.request-item__meta {
+  font-size: 11px;
+  color: #5d5d5d;
+  white-space: nowrap;
+}
+
+.details {
+  padding: 10px 12px 14px;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.details__title {
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.details__body {
+  font-size: 12px;
+  color: #2a2a2a;
+}
+
+.details__section {
+  margin-bottom: 10px;
+}
+
+.details__section-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.details__field {
+  display: grid;
+  grid-template-columns: 130px 1fr auto;
+  gap: 6px;
+  padding: 2px 0;
+  align-items: start;
+}
+
+.details__field--single {
+  grid-template-columns: 130px 1fr;
+}
+
+.details__key {
+  color: #5a5a5a;
+}
+
+.details__value {
+  word-break: break-word;
+}
+
+.details__link {
+  font-size: 11px;
+  color: #1a66d4;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.empty {
+  padding: 10px 12px;
+  color: #888;
+  font-size: 12px;
+}
+
+.status {
+  padding: 6px 12px;
+  font-size: 12px;
+  border-bottom: 1px solid #f0f0f0;
+  color: #9a3b00;
+  background: #fff4eb;
+}
+
+.status.hidden {
+  display: none;
+}
+
+

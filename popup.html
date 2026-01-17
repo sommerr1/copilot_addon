@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Requests</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="toolbar">
+      <div class="toolbar__title">Copilot API Requests</div>
+      <button id="clearBtn" class="toolbar__btn" type="button">Clear</button>
+    </header>
+    <div id="status" class="status hidden"></div>
+
+    <section class="requests">
+      <div id="emptyState" class="empty">No requests yet.</div>
+      <ul id="requestList" class="request-list"></ul>
+    </section>
+
+    <section class="details">
+      <div class="details__title">Request details</div>
+      <div id="detailsBody" class="details__body empty">
+        Select a request to see all fields.
+      </div>
+    </section>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
+
+

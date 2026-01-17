@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Tab Request Viewer",
+  "version": "1.0.0",
+  "description": "Shows network requests from the current tab in real time.",
+  "permissions": ["tabs", "webRequest", "storage", "debugger", "windows"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Requests"
+  }
+}
+
+
