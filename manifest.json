@@ -1,22 +1,28 @@
 {
   "manifest_version": 3,
-  "name": "Tab Request Viewer",
+  "name": "Copilot Chat Indexer",
   "version": "1.0.0",
-  "description": "Shows network requests from the current tab in real time.",
-  "permissions": ["tabs", "webRequest", "storage", "debugger", "windows"],
-  "host_permissions": ["<all_urls>"],
+  "description": "Local indexing and search for Microsoft Copilot chats",
+  "permissions": ["tabs", "webRequest", "storage", "debugger", "windows", "scripting"],
+  "host_permissions": ["*://copilot.microsoft.com/*"],
   "background": {
     "service_worker": "background.js"
   },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Requests"
+    "default_title": "Copilot Indexer"
   },
   "content_scripts": [
     {
       "matches": ["*://copilot.microsoft.com/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["storage/*", "lib/*"],
+      "matches": ["*://copilot.microsoft.com/*"]
     }
   ]
 }

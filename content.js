@@ -8,12 +8,11 @@ function convertHtmlToPlainText(html) {
     // 2. Удаляем элементы, которые точно не нужны
     const selectorsToRemove = [
         "img",
-        "[aria-label]",
         ".sr-only",
         "[data-testid='sticky-header']",
         "[data-testid='date-divider']",
         "svg",
-        "button",
+        "button:not([data-content])",
         "nav",
         "header",
         "footer"
@@ -25,13 +24,17 @@ function convertHtmlToPlainText(html) {
     // 3. Теги, из которых извлекаем текст
     const allowedTags = [
         "p", "li", "h1", "h2", "h3", "h4", "h5", "h6",
-        "code", "pre", "td", "th"
+        "code", "pre", "td", "th", "span", "div"
     ];
 
     let fragments = [];
 
     allowedTags.forEach(tag => {
         doc.querySelectorAll(tag).forEach(el => {
+            // Пропускаем элементы, которые являются частью UI, а не контента
+            if (el.closest('button') && !el.hasAttribute('data-content')) return;
+            if (el.closest('nav') || el.closest('header') || el.closest('footer')) return;
+            
             let text = el.textContent || "";
 
             // 4. Удаляем эмодзи
@@ -248,6 +251,193 @@ function waitForAccountPopup(maxAttempts = 10, delay = 500) {
   });
 }
 
+// Функция для извлечения сообщений из чата
+function extractChatMessages() {
+  const messages = [];
+  
+  // Ищем сообщения пользователя и ассистента
+  // Copilot использует определенные селекторы для сообщений
+  const userMessageSelectors = [
+    '[data-content="user-message"]',
+    '[data-testid*="user-message"]',
+    '[role="article"][aria-labelledby*="user-message"]',
+    '.user-message',
+    '[class*="user-message"]'
+  ];
+  
+  const assistantMessageSelectors = [
+    '[data-content="ai-message"]',
+    '[data-testid*="ai-message"]',
+    '[role="article"][aria-labelledby*="ai-message"]',
+    '.ai-message',
+    '[class*="ai-message"]',
+    '[class*="assistant-message"]'
+  ];
+  
+  // Извлекаем сообщения пользователя
+  for (const selector of userMessageSelectors) {
+    const elements = document.querySelectorAll(selector);
+    for (const el of elements) {
+      // Используем улучшенный парсинг для извлечения текста
+      const fragments = convertHtmlToPlainText(el.innerHTML);
+      const fullText = fragments.join(' ').trim();
+      
+      if (fullText.length > 0) {
+        // Извлекаем временную метку если есть
+        const timeEl = el.querySelector('time') || 
+                      el.closest('[role="article"]')?.querySelector('time') ||
+                      el.closest('[role="article"]')?.querySelector('[data-testid*="date"]');
+        let timestamp = null;
+        if (timeEl) {
+          timestamp = timeEl.getAttribute('datetime') || 
+                     timeEl.getAttribute('title') || 
+                     timeEl.textContent;
+        }
+        
+        // Если нашли несколько фрагментов, создаем отдельные сообщения
+        if (fragments.length > 1) {
+          fragments.forEach(fragment => {
+            if (fragment.trim().length > 1) {
+              messages.push({
+                role: 'user',
+                text: fragment.trim(),
+                timestampUTC: timestamp ? new Date(timestamp).toISOString() : new Date().toISOString()
+              });
+            }
+          });
+        } else {
+          messages.push({
+            role: 'user',
+            text: fullText,
+            timestampUTC: timestamp ? new Date(timestamp).toISOString() : new Date().toISOString()
+          });
+        }
+      }
+    }
+  }
+  
+  // Извлекаем сообщения ассистента
+  for (const selector of assistantMessageSelectors) {
+    const elements = document.querySelectorAll(selector);
+    for (const el of elements) {
+      const fragments = convertHtmlToPlainText(el.innerHTML);
+      const fullText = fragments.join(' ').trim();
+      
+      if (fullText.length > 0) {
+        const timeEl = el.querySelector('time') || 
+                      el.closest('[role="article"]')?.querySelector('time') ||
+                      el.closest('[role="article"]')?.querySelector('[data-testid*="date"]');
+        let timestamp = null;
+        if (timeEl) {
+          timestamp = timeEl.getAttribute('datetime') || 
+                     timeEl.getAttribute('title') || 
+                     timeEl.textContent;
+        }
+        
+        if (fragments.length > 1) {
+          fragments.forEach(fragment => {
+            if (fragment.trim().length > 1) {
+              messages.push({
+                role: 'assistant',
+                text: fragment.trim(),
+                timestampUTC: timestamp ? new Date(timestamp).toISOString() : new Date().toISOString()
+              });
+            }
+          });
+        } else {
+          messages.push({
+            role: 'assistant',
+            text: fullText,
+            timestampUTC: timestamp ? new Date(timestamp).toISOString() : new Date().toISOString()
+          });
+        }
+      }
+    }
+  }
+  
+  // Если не нашли через селекторы, используем улучшенный парсинг
+  if (messages.length === 0) {
+    const allMessages = document.querySelectorAll('[role="article"]');
+    for (const msgEl of allMessages) {
+      const isUser = msgEl.querySelector('[data-content="user-message"]') || 
+                     msgEl.getAttribute('aria-labelledby')?.includes('user-message');
+      const isAssistant = msgEl.querySelector('[data-content="ai-message"]') ||
+                          msgEl.getAttribute('aria-labelledby')?.includes('ai-message') ||
+                          msgEl.getAttribute('aria-labelledby')?.includes('author') ||
+                          msgEl.classList.toString().includes('ai-message');
+      
+      if (isUser || isAssistant) {
+        const fragments = convertHtmlToPlainText(msgEl.innerHTML);
+        const fullText = fragments.join(' ').trim();
+        
+        if (fullText.length > 0) {
+          const timeEl = msgEl.querySelector('time') || msgEl.querySelector('[data-testid*="date"]');
+          const timestamp = timeEl ? (timeEl.getAttribute('datetime') || timeEl.textContent) : null;
+          
+          messages.push({
+            role: isUser ? 'user' : 'assistant',
+            text: fullText,
+            timestampUTC: timestamp ? new Date(timestamp).toISOString() : new Date().toISOString()
+          });
+        }
+      }
+    }
+  }
+  
+  // Сортируем сообщения по времени (если есть временные метки)
+  messages.sort((a, b) => {
+    const timeA = new Date(a.timestampUTC).getTime();
+    const timeB = new Date(b.timestampUTC).getTime();
+    return timeA - timeB;
+  });
+  
+  // Удаляем дубликаты по тексту
+  const uniqueMessages = [];
+  const seenTexts = new Set();
+  for (const msg of messages) {
+    const textKey = msg.text.substring(0, 150).toLowerCase().trim(); // Первые 150 символов для сравнения
+    if (!seenTexts.has(textKey) && textKey.length > 2) {
+      seenTexts.add(textKey);
+      uniqueMessages.push(msg);
+    }
+  }
+  
+  return uniqueMessages;
+}
+
+// Улучшенная функция для извлечения текста из HTML с разделением на сообщения
+function extractMessagesFromChat() {
+  const messages = extractChatMessages();
+  
+  // Если не нашли через селекторы, используем общий парсинг
+  if (messages.length === 0) {
+    const chatContainer = document.querySelector('[data-content="conversation"]') || 
+                          document.querySelector('[data-testid="chat-page"]') ||
+                          document.body;
+    
+    if (chatContainer) {
+      const fragments = convertHtmlToPlainText(chatContainer.innerHTML);
+      // Пытаемся определить роль по контексту (это упрощенный подход)
+      let currentRole = 'user';
+      for (const fragment of fragments) {
+        if (fragment.trim().length > 1) {
+          // Простая эвристика: если фраза начинается с определенных слов, это может быть ассистент
+          const isAssistant = /^(отлично|давайте|можно|рекомендую|согласно|вот|это|таким образом)/i.test(fragment.trim());
+          messages.push({
+            role: isAssistant ? 'assistant' : currentRole,
+            text: fragment.trim(),
+            timestampUTC: new Date().toISOString()
+          });
+          // Чередуем роли для следующих сообщений
+          currentRole = currentRole === 'user' ? 'assistant' : 'user';
+        }
+      }
+    }
+  }
+  
+  return messages;
+}
+
 // Слушаем сообщения от popup/background
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'getAccountInfo') {
@@ -273,6 +463,173 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         source: 'content_script'
       });
     }
+    return true;
+  }
+  
+  if (request.action === 'checkContentReady') {
+    // Проверяем, готов ли контент к индексации (есть ли сообщения)
+    const messages = extractMessagesFromChat();
+    const hasUserMessages = messages.some(msg => msg.role === 'user' && msg.text && msg.text.trim().length > 0);
+    
+    sendResponse({
+      success: true,
+      ready: hasUserMessages && messages.length > 0,
+      messageCount: messages.length,
+      userMessageCount: messages.filter(msg => msg.role === 'user').length
+    });
+    return true;
+  }
+  
+  if (request.action === 'checkContentReadyAndGet') {
+    // Объединенная проверка готовности и получение контента
+    // Это позволяет избежать двойных запросов
+    let chatId = request.chatId || null;
+    
+    // Извлекаем chatId если не передан
+    if (!chatId) {
+      const url = window.location.href;
+      let urlMatch = url.match(/\/chats\/([^\/\?]+)/);
+      if (urlMatch) {
+        chatId = urlMatch[1];
+      } else {
+        const urlParams = new URLSearchParams(window.location.search);
+        chatId = urlParams.get('chatId') || urlParams.get('id') || urlParams.get('conversationId');
+      }
+    }
+    
+    const messages = extractMessagesFromChat();
+    const hasUserMessages = messages.some(msg => msg.role === 'user' && msg.text && msg.text.trim().length > 0);
+    const isReady = hasUserMessages && messages.length > 0;
+    
+    // Если готов, возвращаем контент сразу
+    if (isReady && chatId) {
+      sendResponse({
+        success: true,
+        ready: true,
+        chatId,
+        messages: messages.map((msg, index) => ({
+          id: `${chatId}_${index}_${Date.now()}`,
+          chatId,
+          role: msg.role,
+          text: msg.text,
+          timestampUTC: msg.timestampUTC
+        })),
+        messageCount: messages.length,
+        userMessageCount: messages.filter(msg => msg.role === 'user').length
+      });
+    } else {
+      // Если не готов, возвращаем только статус
+      sendResponse({
+        success: true,
+        ready: false,
+        messageCount: messages.length,
+        userMessageCount: messages.filter(msg => msg.role === 'user').length,
+        chatId: chatId || null
+      });
+    }
+    return true;
+  }
+  
+  if (request.action === 'getChatContent') {
+    // Извлекаем ID чата из параметров запроса (приоритет) или из URL
+    let chatId = request.chatId || null;
+    const chatIdFromRequest = chatId; // Сохраняем, был ли chatId передан в запросе
+    
+    if (!chatId) {
+      // Пробуем разные форматы URL
+      const url = window.location.href;
+      
+      // Формат 1: /chats/{chatId}
+      let urlMatch = url.match(/\/chats\/([^\/\?]+)/);
+      if (urlMatch) {
+        chatId = urlMatch[1];
+      }
+      
+      // Формат 2: ?chatId=... или ?id=...
+      if (!chatId) {
+        const urlParams = new URLSearchParams(window.location.search);
+        chatId = urlParams.get('chatId') || urlParams.get('id') || urlParams.get('conversationId');
+      }
+      
+      // Формат 3: Из hash (#chatId=...)
+      if (!chatId) {
+        const hashParams = new URLSearchParams(window.location.hash.substring(1));
+        chatId = hashParams.get('chatId') || hashParams.get('id');
+      }
+      
+      // Формат 4: Пробуем извлечь из пути, если формат другой
+      if (!chatId) {
+        const pathMatch = url.match(/\/conversation[s]?\/([^\/\?]+)/i);
+        if (pathMatch) {
+          chatId = pathMatch[1];
+        }
+      }
+      
+      // Формат 5: Пробуем найти в DOM (если чат открыт)
+      if (!chatId) {
+        // Ищем в data-атрибутах
+        const chatElement = document.querySelector('[data-chat-id], [data-conversation-id], [data-chatid]');
+        if (chatElement) {
+          chatId = chatElement.getAttribute('data-chat-id') || 
+                   chatElement.getAttribute('data-conversation-id') || 
+                   chatElement.getAttribute('data-chatid');
+        }
+      }
+      
+      // Формат 6: Пробуем извлечь из window.location.pathname
+      if (!chatId) {
+        const pathParts = window.location.pathname.split('/').filter(p => p);
+        const chatsIndex = pathParts.indexOf('chats');
+        if (chatsIndex >= 0 && chatsIndex < pathParts.length - 1) {
+          chatId = pathParts[chatsIndex + 1];
+        }
+      }
+    }
+    
+    // Если chatId был передан в запросе, используем его даже если не найден в URL
+    if (!chatId && chatIdFromRequest) {
+      chatId = chatIdFromRequest;
+      console.log('getChatContent: Using chatId from request:', chatId);
+    }
+    
+    // Если все еще не нашли, логируем для отладки
+    if (!chatId) {
+      console.warn('getChatContent: Chat ID not found. URL:', window.location.href);
+      console.warn('getChatContent: Pathname:', window.location.pathname);
+      console.warn('getChatContent: Search:', window.location.search);
+      console.warn('getChatContent: Hash:', window.location.hash);
+      console.warn('getChatContent: Request chatId:', request.chatId);
+      
+      sendResponse({
+        success: false,
+        error: 'Chat ID not found in URL',
+        debug: {
+          url: window.location.href,
+          pathname: window.location.pathname,
+          search: window.location.search,
+          hash: window.location.hash,
+          requestChatId: request.chatId
+        }
+      });
+      return true;
+    }
+    
+    console.log('getChatContent: Using chatId:', chatId, 'fromRequest:', !!chatIdFromRequest);
+    
+    // Извлекаем сообщения
+    const messages = extractMessagesFromChat();
+    
+    sendResponse({
+      success: true,
+      chatId,
+      messages: messages.map((msg, index) => ({
+        id: `${chatId}_${index}_${Date.now()}`,
+        chatId,
+        role: msg.role,
+        text: msg.text,
+        timestampUTC: msg.timestampUTC
+      }))
+    });
     return true;
   }
   

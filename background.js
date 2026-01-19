@@ -7,6 +7,8 @@ const tabOrigins = new Map();
 const debuggerTabs = new Set();
 const debuggerAttachInFlight = new Map();
 let lastActiveHttpTabId = null;
+let isIndexingActive = false; // Флаг активной индексации
+let shouldStopIndexing = false; // Флаг для остановки индексации
 
 function shouldStoreRequest(url) {
   if (!url) {
@@ -181,8 +183,14 @@ function upsertRequest(tabId, requestId, update) {
 }
 
 function storeRequest(tabId, requestId, update) {
+  // Не сохраняем новые запросы во время активной индексации
   const key = `${tabId}:${requestId}`;
   const existing = requestIndexById.get(key);
+  
+  // Если идет индексация и это новый запрос (не обновление существующего), пропускаем его
+  if (isIndexingActive && !existing) {
+    return;
+  }
   
   // For new requests, check if URL matches filter
   if (!existing) {
@@ -533,6 +541,623 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 });
 
+// ========== IndexedDB Functions (inline for service worker) ==========
+const DB_NAME = 'copilot_indexer';
+const DB_VERSION = 1;
+
+let dbInstance = null;
+
+async function initDB() {
+  if (dbInstance) return dbInstance;
+  
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => {
+      dbInstance = request.result;
+      resolve(dbInstance);
+    };
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains('accounts')) {
+        const accountsStore = db.createObjectStore('accounts', { keyPath: 'email' });
+        accountsStore.createIndex('email', 'email', { unique: true });
+      }
+      if (!db.objectStoreNames.contains('chats')) {
+        const chatsStore = db.createObjectStore('chats', { keyPath: 'chatId' });
+        chatsStore.createIndex('accountEmail', 'accountEmail', { unique: false });
+        chatsStore.createIndex('lastIndexedUTC', 'lastIndexedUTC', { unique: false });
+      }
+      if (!db.objectStoreNames.contains('messages')) {
+        const messagesStore = db.createObjectStore('messages', { keyPath: 'id' });
+        messagesStore.createIndex('chatId', 'chatId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains('indexes')) {
+        db.createObjectStore('indexes', { keyPath: 'accountEmail' });
+      }
+    };
+  });
+}
+
+function toUTCString(date = new Date()) {
+  return date.toISOString();
+}
+
+async function getAccount(email) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['accounts'], 'readonly');
+    const store = transaction.objectStore('accounts');
+    const request = store.get(email);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function createAccount(email, data = {}) {
+  const db = await initDB();
+  const account = {
+    email,
+    lastIndexedUTC: null,
+    createdAtUTC: toUTCString(),
+    ...data
+  };
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['accounts'], 'readwrite');
+    const store = transaction.objectStore('accounts');
+    const request = store.put(account);
+    request.onsuccess = () => resolve(account);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function createChat(chatData) {
+  const db = await initDB();
+  const chat = {
+    chatId: chatData.chatId,
+    accountEmail: chatData.accountEmail,
+    title: chatData.title || '',
+    url: chatData.url || `https://copilot.microsoft.com/chats/${chatData.chatId}`,
+    updatedAtUTC: chatData.updatedAtUTC || toUTCString(),
+    lastIndexedUTC: chatData.lastIndexedUTC || null
+  };
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['chats'], 'readwrite');
+    const store = transaction.objectStore('chats');
+    const request = store.put(chat);
+    request.onsuccess = () => resolve(chat);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getChatsByAccount(accountEmail) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['chats'], 'readonly');
+    const store = transaction.objectStore('chats');
+    const index = store.index('accountEmail');
+    const request = index.getAll(accountEmail);
+    request.onsuccess = () => {
+      const chats = request.result || [];
+      // Дедупликация по chatId (на случай, если есть дубликаты)
+      const uniqueChats = new Map();
+      for (const chat of chats) {
+        if (chat.chatId && !uniqueChats.has(chat.chatId)) {
+          uniqueChats.set(chat.chatId, chat);
+        }
+      }
+      resolve(Array.from(uniqueChats.values()));
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function updateChat(chatId, updates) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['chats'], 'readwrite');
+    const store = transaction.objectStore('chats');
+    const getRequest = store.get(chatId);
+    getRequest.onsuccess = () => {
+      const chat = getRequest.result;
+      if (!chat) {
+        reject(new Error(`Chat ${chatId} not found`));
+        return;
+      }
+      const updated = { ...chat, ...updates };
+      const putRequest = store.put(updated);
+      putRequest.onsuccess = () => resolve(updated);
+      putRequest.onerror = () => reject(putRequest.error);
+    };
+    getRequest.onerror = () => reject(getRequest.error);
+  });
+}
+
+async function createMessage(messageData) {
+  const db = await initDB();
+  const message = {
+    id: messageData.id || `${messageData.chatId}_${Date.now()}_${Math.random()}`,
+    chatId: messageData.chatId,
+    role: messageData.role || 'user',
+    text: messageData.text || '',
+    timestampUTC: messageData.timestampUTC || toUTCString()
+  };
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['messages'], 'readwrite');
+    const store = transaction.objectStore('messages');
+    const request = store.put(message);
+    request.onsuccess = () => resolve(message);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// Батчинг для сохранения множества сообщений одной транзакцией
+async function createMessagesBatch(messages) {
+  if (!messages || messages.length === 0) {
+    return;
+  }
+  
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['messages'], 'readwrite');
+    const store = transaction.objectStore('messages');
+    let completed = 0;
+    let hasError = false;
+    
+    for (const msg of messages) {
+      const message = {
+        id: msg.id || `${msg.chatId}_${Date.now()}_${Math.random()}`,
+        chatId: msg.chatId,
+        role: msg.role || 'user',
+        text: msg.text || '',
+        timestampUTC: msg.timestampUTC || toUTCString()
+      };
+      
+      const request = store.put(message);
+      request.onsuccess = () => {
+        completed++;
+        if (completed === messages.length && !hasError) {
+          resolve();
+        }
+      };
+      request.onerror = () => {
+        if (!hasError) {
+          hasError = true;
+          reject(request.error);
+        }
+      };
+    }
+    
+    // Если массив пустой после фильтрации
+    if (messages.length === 0) {
+      resolve();
+    }
+  });
+}
+
+async function getMessagesByChat(chatId) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['messages'], 'readonly');
+    const store = transaction.objectStore('messages');
+    const index = store.index('chatId');
+    const request = index.getAll(chatId);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function deleteMessagesByChat(chatId) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['messages'], 'readwrite');
+    const store = transaction.objectStore('messages');
+    const index = store.index('chatId');
+    const request = index.openCursor(IDBKeyRange.only(chatId));
+    request.onsuccess = (event) => {
+      const cursor = event.target.result;
+      if (cursor) {
+        cursor.delete();
+        cursor.continue();
+      } else {
+        resolve();
+      }
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function saveIndex(accountEmail, indexData) {
+  const db = await initDB();
+  const indexRecord = {
+    accountEmail,
+    flexIndexJSON: indexData,
+    updatedAtUTC: toUTCString()
+  };
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['indexes'], 'readwrite');
+    const store = transaction.objectStore('indexes');
+    const request = store.put(indexRecord);
+    request.onsuccess = () => resolve(indexRecord);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getIndex(accountEmail) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['indexes'], 'readonly');
+    const store = transaction.objectStore('indexes');
+    const request = store.get(accountEmail);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// ========== JWT Decoding ==========
+function decodeJWT(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) {
+      console.log('decodeJWT: Invalid token format, parts count:', parts.length);
+      return null;
+    }
+    let base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    while (base64.length % 4) base64 += '=';
+    const payload = JSON.parse(atob(base64));
+    console.log('decodeJWT: Decoded payload keys:', Object.keys(payload));
+    return payload;
+  } catch (error) {
+    console.error('decodeJWT: Error decoding token:', error);
+    return null;
+  }
+}
+
+function extractEmailFromRequest(record) {
+  if (!record.requestHeaders) {
+    console.log('extractEmailFromRequest: No request headers');
+    return null;
+  }
+  
+  console.log('extractEmailFromRequest: Checking headers, count:', record.requestHeaders.length);
+  
+  for (const header of record.requestHeaders) {
+    const name = (header.name || '').toLowerCase();
+    const value = header.value || '';
+    
+    if (name === 'authorization' && value.startsWith('Bearer ')) {
+      const token = value.substring(7).trim();
+      console.log('extractEmailFromRequest: Found Bearer token, length:', token.length);
+      const payload = decodeJWT(token);
+      if (payload) {
+        // Пробуем разные поля, которые могут содержать email
+        const email = payload.email || 
+                     payload.upn || 
+                     payload.unique_name || 
+                     payload.preferred_username ||
+                     payload.oid || // Object ID (может использоваться как идентификатор)
+                     payload.sub || // Subject
+                     payload.name ||
+                     payload.aud; // Audience (может содержать email)
+        
+        // Если нашли что-то похожее на email
+        if (email && typeof email === 'string' && email.includes('@')) {
+          console.log('extractEmailFromRequest: Decoded JWT, found email:', email, 'payload keys:', Object.keys(payload));
+          return email;
+        } else {
+          console.log('extractEmailFromRequest: JWT decoded but no email found. Payload:', JSON.stringify(payload).substring(0, 500));
+        }
+      } else {
+        console.log('extractEmailFromRequest: Failed to decode JWT');
+      }
+    }
+  }
+  
+  console.log('extractEmailFromRequest: No email found in headers');
+  return null;
+}
+
+// ========== Chat Parsing ==========
+async function parseChatsFromResponse(responseBody, accountEmail) {
+  if (!responseBody || !responseBody.text) {
+    console.log('parseChatsFromResponse: No response body or text');
+    return;
+  }
+  
+  try {
+    const data = JSON.parse(responseBody.text);
+    
+    // Логируем структуру ответа для отладки
+    console.log('parseChatsFromResponse: Response structure:', {
+      isArray: Array.isArray(data),
+      hasValue: !!data.value,
+      hasItems: !!data.items,
+      hasConversations: !!data.conversations,
+      keys: !Array.isArray(data) ? Object.keys(data) : [],
+      dataPreview: JSON.stringify(data).substring(0, 200)
+    });
+    
+    // Структура ответа может быть разной, пробуем разные варианты
+    let chats = [];
+    
+    if (Array.isArray(data)) {
+      chats = data;
+      console.log('parseChatsFromResponse: Using direct array, length:', chats.length);
+    } else if (data.value && Array.isArray(data.value)) {
+      chats = data.value;
+      console.log('parseChatsFromResponse: Using data.value, length:', chats.length);
+    } else if (data.items && Array.isArray(data.items)) {
+      chats = data.items;
+      console.log('parseChatsFromResponse: Using data.items, length:', chats.length);
+    } else if (data.conversations && Array.isArray(data.conversations)) {
+      chats = data.conversations;
+      console.log('parseChatsFromResponse: Using data.conversations, length:', chats.length);
+    } else if (data.data && Array.isArray(data.data)) {
+      chats = data.data;
+      console.log('parseChatsFromResponse: Using data.data, length:', chats.length);
+    } else if (data.results && Array.isArray(data.results)) {
+      chats = data.results;
+      console.log('parseChatsFromResponse: Using data.results, length:', chats.length);
+      
+      // Проверяем на пустой ответ истории чата (results пустой и next null)
+      // Это нормальная ситуация для пустых чатов, просто пропускаем
+      if (chats.length === 0 && (data.next === null || data.next === undefined)) {
+        console.log('parseChatsFromResponse: Empty history response (results: [], next: null), skipping');
+        return;
+      }
+    } else {
+      // Если структура не распознана, логируем полный ответ для анализа
+      console.warn('parseChatsFromResponse: Unknown response structure:', {
+        type: typeof data,
+        keys: Object.keys(data || {}),
+        sample: JSON.stringify(data).substring(0, 1000)
+      });
+    }
+    
+    console.log(`parseChatsFromResponse: Found ${chats.length} chats for account ${accountEmail}`);
+    
+    if (chats.length === 0) {
+      // Для запросов истории чата это нормально, просто логируем и выходим
+      console.log('parseChatsFromResponse: No chats found in response, skipping processing');
+      return;
+    }
+    
+    // Получаем существующие чаты для аккаунта, чтобы избежать дубликатов
+    const existingChats = await getChatsByAccount(accountEmail);
+    const existingChatIds = new Set(existingChats.map(c => c.chatId));
+    
+    let savedCount = 0;
+    let updatedCount = 0;
+    let skippedCount = 0;
+    for (const chat of chats) {
+      // Извлекаем данные чата (структура может отличаться)
+      const chatId = chat.id || chat.chatId || chat.conversationId || chat.conversation_id || chat.conversationId;
+      const title = chat.title || chat.name || chat.displayName || chat.subject || '';
+      const updatedAt = chat.updatedAt || chat.updated_at || chat.lastModified || chat.modifiedTime || chat.updatedDateTime;
+      
+      if (!chatId) {
+        console.log('parseChatsFromResponse: Skipping chat without ID:', {
+          chatKeys: Object.keys(chat),
+          chatSample: JSON.stringify(chat).substring(0, 200)
+        });
+        skippedCount++;
+        continue;
+      }
+      
+      // Пропускаем чаты с пустым title или с title "Без названия"
+      const hasTitle = title && title.trim() && title.trim() !== 'Без названия';
+      if (!hasTitle) {
+        console.log(`parseChatsFromResponse: Skipping chat ${chatId} - no title or title is "Без названия"`);
+        skippedCount++;
+        continue;
+      }
+      
+      // Преобразуем время в UTC строку
+      let updatedAtUTC = toUTCString();
+      if (updatedAt) {
+        try {
+          updatedAtUTC = toUTCString(new Date(updatedAt));
+        } catch (e) {
+          console.warn('parseChatsFromResponse: Failed to parse date:', updatedAt, e);
+          // Используем текущее время
+        }
+      }
+      
+      try {
+        // Проверяем, существует ли чат в БД
+        const existingChat = existingChatIds.has(chatId) 
+          ? existingChats.find(c => c.chatId === chatId)
+          : null;
+        
+        if (existingChat) {
+          // Чат существует - обновляем только если данные изменились
+          const needsUpdate = existingChat.title !== title || 
+                             existingChat.updatedAtUTC !== updatedAtUTC ||
+                             existingChat.accountEmail !== accountEmail;
+          
+          if (needsUpdate) {
+            await updateChat(chatId, {
+              title,
+              updatedAtUTC,
+              accountEmail
+            });
+            updatedCount++;
+          }
+          // Если данные не изменились, пропускаем
+        } else {
+          // Чат новый - создаем
+      await createChat({
+        chatId,
+        accountEmail,
+        title,
+        updatedAtUTC,
+        url: `https://copilot.microsoft.com/chats/${chatId}`
+      });
+      savedCount++;
+          // Добавляем в множество существующих, чтобы не обрабатывать повторно в этом цикле
+          existingChatIds.add(chatId);
+        }
+      } catch (error) {
+        console.error(`parseChatsFromResponse: Error saving chat ${chatId}:`, error);
+      }
+    }
+    
+    console.log(`parseChatsFromResponse: Saved ${savedCount} new chats, updated ${updatedCount} existing chats, skipped ${skippedCount} for account ${accountEmail}`);
+  } catch (error) {
+    console.error('Error parsing chats:', error);
+    console.error('Response body preview:', responseBody.text?.substring(0, 1000));
+    throw error; // Пробрасываем ошибку дальше для лучшей диагностики
+  }
+}
+
+// ========== Process Conversations Response ==========
+async function processConversationsResponse(tabId, requestId) {
+  const key = `${tabId}:${requestId}`;
+  const record = requestIndexById.get(key);
+  
+  // Проверяем, не обработан ли уже этот запрос
+  if (record && record.conversationsProcessed) {
+    console.log('processConversationsResponse: Request already processed, skipping', {
+      tabId,
+      requestId,
+      url: record.url
+    });
+    return;
+  }
+  
+  console.log('processConversationsResponse: Starting processing', {
+    tabId,
+    requestId,
+    hasRecord: !!record,
+    hasResponseBody: !!(record && record.responseBody),
+    hasText: !!(record && record.responseBody && record.responseBody.text),
+    url: record?.url
+  });
+  
+  if (!record || !record.responseBody || !record.responseBody.text) {
+    console.log('processConversationsResponse: No record or response body', {
+      hasRecord: !!record,
+      hasResponseBody: !!(record && record.responseBody),
+      hasText: !!(record && record.responseBody && record.responseBody.text)
+    });
+    return;
+  }
+  
+  // Извлекаем email из запроса
+  let accountEmail = extractEmailFromRequest(record);
+  console.log('processConversationsResponse: Email from request headers:', accountEmail);
+  
+  // Если не нашли в заголовках, пробуем получить из storage
+  if (!accountEmail) {
+    try {
+      const stored = await chrome.storage.local.get(['copilotAccountEmail']);
+      accountEmail = stored.copilotAccountEmail;
+      console.log('processConversationsResponse: Email from storage:', accountEmail);
+    } catch (e) {
+      console.error('processConversationsResponse: Error getting email from storage:', e);
+    }
+  }
+  
+  // Если все еще не нашли, пробуем получить из content script
+  if (!accountEmail) {
+    try {
+      const tabs = await chrome.tabs.query({ url: "*://copilot.microsoft.com/*" });
+      if (tabs.length > 0) {
+        const response = await chrome.tabs.sendMessage(tabs[0].id, { action: 'getAccountInfo' });
+        if (response && response.success && response.email) {
+          accountEmail = response.email;
+          // Сохраняем в storage для будущего использования
+          await chrome.storage.local.set({ copilotAccountEmail: accountEmail });
+          console.log('processConversationsResponse: Email from content script:', accountEmail);
+        }
+      }
+    } catch (e) {
+      console.error('processConversationsResponse: Error getting email from content script:', e);
+    }
+  }
+  
+  if (!accountEmail) {
+    console.warn('processConversationsResponse: Account email not found, skipping chat parsing. Response body length:', record.responseBody.text?.length);
+    // Логируем структуру ответа для анализа
+    try {
+      const data = JSON.parse(record.responseBody.text);
+      console.warn('processConversationsResponse: Response structure (for debugging):', {
+        isArray: Array.isArray(data),
+        keys: !Array.isArray(data) ? Object.keys(data) : [],
+        preview: JSON.stringify(data).substring(0, 500)
+      });
+    } catch (e) {
+      console.warn('processConversationsResponse: Could not parse response as JSON');
+    }
+    return;
+  }
+  
+  // Проверяем, является ли это запросом истории чата (history?api-version=2)
+  const isHistoryRequest = record.url && record.url.includes('/history?api-version=2');
+  
+  if (isHistoryRequest) {
+    try {
+      const data = JSON.parse(record.responseBody.text);
+      
+      // Проверяем на пустой ответ истории чата
+      // Если results пустой массив и next null, пропускаем обработку и удаляем из списка запросов
+      if (data.results && Array.isArray(data.results) && data.results.length === 0 && 
+          (data.next === null || data.next === undefined)) {
+        console.log('processConversationsResponse: Skipping empty history response', {
+          url: record.url,
+          resultsLength: data.results.length,
+          next: data.next
+        });
+        
+        // Помечаем запрос как обработанный перед удалением
+        storeRequest(tabId, requestId, {
+          conversationsProcessed: true
+        });
+        
+        // Удаляем пустой запрос из списка запросов
+        const list = getTabRequests(tabId);
+        const index = list.findIndex((r) => r.id === requestId);
+        if (index !== -1) {
+          list.splice(index, 1);
+          requestIndexById.delete(key);
+          console.log('processConversationsResponse: Removed empty history request from list');
+        }
+        
+        return;
+      }
+      
+      // Если results не пустой, продолжаем обработку
+      if (data.results && Array.isArray(data.results) && data.results.length > 0) {
+        console.log('processConversationsResponse: History response has data', {
+          url: record.url,
+          resultsLength: data.results.length,
+          next: data.next
+        });
+      }
+    } catch (parseError) {
+      // Если не удалось распарсить JSON, продолжаем обычную обработку
+      console.warn('processConversationsResponse: Could not parse response to check for empty history:', parseError);
+    }
+  }
+  
+  // Создаем или обновляем аккаунт
+  try {
+  await createAccount(accountEmail);
+  console.log('processConversationsResponse: Account created/updated:', accountEmail);
+  } catch (error) {
+    console.error('processConversationsResponse: Error creating account:', error);
+  }
+  
+  // Парсим чаты
+  try {
+  await parseChatsFromResponse(record.responseBody, accountEmail);
+    console.log('processConversationsResponse: Successfully processed conversations response');
+  } catch (error) {
+    console.error('processConversationsResponse: Error parsing chats:', error);
+    // Не пробрасываем ошибку дальше, чтобы не прерывать другие процессы
+  }
+}
+
 chrome.debugger.onEvent.addListener((source, method, params) => {
   if (!source.tabId) {
     return;
@@ -563,36 +1188,18 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
     }
     case "Network.responseReceived": {
       const response = params.response || {};
+      const key = `${tabId}:${params.requestId}`;
+      const existing = requestIndexById.get(key);
+      const requestUrl = existing ? existing.url : (response.url || '');
+      const isConversationsRequest = requestUrl && shouldStoreRequest(requestUrl);
+      
       storeRequest(tabId, params.requestId, {
         responseHeaders: headersObjectToArray(response.headers || {}),
         statusCode: response.status || null,
         statusLine: response.statusText || "",
         type: params.type || ""
       });
-      // Try to get response body early if it's available
-      // Some responses may be available immediately
-      if (response.status >= 200 && response.status < 300) {
-        setTimeout(() => {
-          chrome.debugger.sendCommand({ tabId }, "Network.getResponseBody", { requestId: params.requestId }, (bodyResponse) => {
-            if (!chrome.runtime.lastError && bodyResponse) {
-              let responseBody = null;
-              if (bodyResponse.base64Encoded) {
-                try {
-                  const text = atob(bodyResponse.body);
-                  responseBody = { text, base64Encoded: true };
-                } catch (error) {
-                  responseBody = { raw: bodyResponse.body, base64Encoded: true };
-                }
-              } else {
-                responseBody = { text: bodyResponse.body, base64Encoded: false };
-              }
-              storeRequest(tabId, params.requestId, {
-                responseBody
-              });
-            }
-          });
-        }, 50);
-      }
+      // Не получаем body здесь - дождемся Network.loadingFinished, когда body точно готов
       break;
     }
     case "Network.responseReceivedExtraInfo": {
@@ -606,10 +1213,14 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
       const key = `${tabId}:${params.requestId}`;
       const existing = requestIndexById.get(key);
       const isFromDebugger = existing ? existing.fromDebugger : false;
+      const url = existing ? existing.url : '';
       
       storeRequest(tabId, params.requestId, {
         completed: true
       });
+      
+      // Check if this is a conversations API request - we need to process it
+      const isConversationsRequest = url && shouldStoreRequest(url);
       
       // Only try to get response body for requests that came through debugger API
       if (isFromDebugger) {
@@ -632,6 +1243,17 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
           storeRequest(tabId, params.requestId, {
             responseBody
           });
+          
+          // Если это запрос к conversations API, обрабатываем после успешного получения body
+          // Это единственное место обработки - когда body точно готов
+          if (isConversationsRequest) {
+            // Небольшая задержка, чтобы убедиться, что responseBody сохранен в storeRequest
+            setTimeout(() => {
+              processConversationsResponse(tabId, params.requestId).catch(err => {
+                console.error('Error processing conversations response:', err);
+              });
+            }, 150);
+          }
         }
         
         function fetchResponseBody(attempt = 0) {
@@ -643,6 +1265,9 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
                 setTimeout(() => {
                   fetchResponseBody(attempt + 1);
                 }, 150 * (attempt + 1));
+              } else {
+                // Если после всех попыток не удалось получить body, пропускаем обработку
+                console.warn('processConversationsResponse: Could not get response body after all attempts, skipping');
               }
               return;
             }
@@ -653,11 +1278,11 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
         }
         
         // Try with initial delay to ensure response is fully loaded, then with retries if needed
-        // Use longer delay for first attempt to ensure response is ready
         setTimeout(() => {
           fetchResponseBody();
         }, 100);
       }
+      // Для не-debugger запросов body получить нельзя, поэтому не обрабатываем
       break;
     }
     case "Network.loadingFailed": {
@@ -671,4 +1296,2448 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
   }
 });
 
+
+// ========== Additional DB Functions ==========
+async function getChat(chatId) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['chats'], 'readonly');
+    const store = transaction.objectStore('chats');
+    const request = store.get(chatId);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getChatsByAccount(accountEmail) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['chats'], 'readonly');
+    const store = transaction.objectStore('chats');
+    const index = store.index('accountEmail');
+    const request = index.getAll(accountEmail);
+    request.onsuccess = () => {
+      const chats = request.result || [];
+      // Дедупликация по chatId (на случай, если есть дубликаты)
+      const uniqueChats = new Map();
+      for (const chat of chats) {
+        if (chat.chatId && !uniqueChats.has(chat.chatId)) {
+          uniqueChats.set(chat.chatId, chat);
+        }
+      }
+      resolve(Array.from(uniqueChats.values()));
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function updateChat(chatId, updates) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['chats'], 'readwrite');
+    const store = transaction.objectStore('chats');
+    const getRequest = store.get(chatId);
+    getRequest.onsuccess = () => {
+      const chat = getRequest.result;
+      if (!chat) {
+        reject(new Error(`Chat ${chatId} not found`));
+        return;
+      }
+      const updated = { ...chat, ...updates };
+      const putRequest = store.put(updated);
+      putRequest.onsuccess = () => resolve(updated);
+      putRequest.onerror = () => reject(putRequest.error);
+    };
+    getRequest.onerror = () => reject(getRequest.error);
+  });
+}
+
+async function deleteMessagesByChat(chatId) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['messages'], 'readwrite');
+    const store = transaction.objectStore('messages');
+    const index = store.index('chatId');
+    const request = index.openCursor(IDBKeyRange.only(chatId));
+    request.onsuccess = (event) => {
+      const cursor = event.target.result;
+      if (cursor) {
+        cursor.delete();
+        cursor.continue();
+      } else {
+        resolve();
+      }
+    };
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function updateAccount(email, updates) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['accounts'], 'readwrite');
+    const store = transaction.objectStore('accounts');
+    const getRequest = store.get(email);
+    getRequest.onsuccess = () => {
+      const account = getRequest.result || { email, createdAtUTC: toUTCString() };
+      const updated = { ...account, ...updates };
+      const putRequest = store.put(updated);
+      putRequest.onsuccess = () => resolve(updated);
+      putRequest.onerror = () => reject(putRequest.error);
+    };
+    getRequest.onerror = () => reject(getRequest.error);
+  });
+}
+
+async function saveIndex(accountEmail, indexData) {
+  const db = await initDB();
+  const indexRecord = {
+    accountEmail,
+    flexIndexJSON: indexData,
+    updatedAtUTC: toUTCString()
+  };
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['indexes'], 'readwrite');
+    const store = transaction.objectStore('indexes');
+    const request = store.put(indexRecord);
+    request.onsuccess = () => resolve(indexRecord);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getIndex(accountEmail) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['indexes'], 'readonly');
+    const store = transaction.objectStore('indexes');
+    const request = store.get(accountEmail);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// ========== Simple Full-Text Search Index (no external dependencies) ==========
+class SimpleSearchIndex {
+  constructor() {
+    // Map: term -> Set of document IDs
+    this.termIndex = new Map();
+    // Map: document ID -> document data
+    this.documents = new Map();
+  }
+  
+  // Tokenize text into searchable terms
+  tokenize(text) {
+    if (!text) return [];
+    // Convert to lowercase, split by non-word characters, filter empty
+    return text.toLowerCase()
+      .replace(/[^\w\s\u0400-\u04FF]/g, ' ') // Support Cyrillic
+      .split(/\s+/)
+      .filter(term => term.length >= 2); // Minimum 2 characters
+  }
+  
+  // Add or update document
+  add(doc) {
+    const docId = doc.id;
+    const searchableText = `${doc.title || ''} ${doc.text || ''}`.trim().toLowerCase();
+    
+    // Remove old terms for this document
+    if (this.documents.has(docId)) {
+      const oldDoc = this.documents.get(docId);
+      const oldText = `${oldDoc.title || ''} ${oldDoc.text || ''}`.trim().toLowerCase();
+      const oldTerms = this.tokenize(oldText);
+      for (const term of oldTerms) {
+        const docSet = this.termIndex.get(term);
+        if (docSet) {
+          docSet.delete(docId);
+          if (docSet.size === 0) {
+            this.termIndex.delete(term);
+          }
+        }
+      }
+    }
+    
+    // Add document
+    this.documents.set(docId, doc);
+    
+    // Index terms
+    const terms = this.tokenize(searchableText);
+    for (const term of terms) {
+      if (!this.termIndex.has(term)) {
+        this.termIndex.set(term, new Set());
+      }
+      this.termIndex.get(term).add(docId);
+    }
+  }
+  
+  // Remove document
+  remove(docId) {
+    if (!this.documents.has(docId)) return;
+    
+    const doc = this.documents.get(docId);
+    const searchableText = `${doc.title || ''} ${doc.text || ''}`.trim().toLowerCase();
+    const terms = this.tokenize(searchableText);
+    
+    for (const term of terms) {
+      const docSet = this.termIndex.get(term);
+      if (docSet) {
+        docSet.delete(docId);
+        if (docSet.size === 0) {
+          this.termIndex.delete(term);
+        }
+      }
+    }
+    
+    this.documents.delete(docId);
+  }
+  
+  // Remove all documents for a specific chat (except chat title document)
+  removeByChatId(chatId) {
+    const docIdsToRemove = [];
+    
+    // Находим все документы для этого чата (кроме документа с названием чата)
+    for (const [docId, doc] of this.documents.entries()) {
+      if (doc.chatId === chatId && docId !== `chat_${chatId}`) {
+        docIdsToRemove.push(docId);
+      }
+    }
+    
+    // Удаляем найденные документы
+    for (const docId of docIdsToRemove) {
+      this.remove(docId);
+    }
+    
+    return docIdsToRemove.length;
+  }
+  
+  // Search for query with partial word matching
+  search(query, options = {}) {
+    const { limit = 100, enrich = false } = options;
+    if (!query || query.trim().length < 2) {
+      return enrich ? [] : [];
+    }
+    
+    const queryLower = query.toLowerCase().trim();
+    const queryTerms = this.tokenize(query);
+    if (queryTerms.length === 0) {
+      return enrich ? [] : [];
+    }
+    
+    // Find documents that match all terms (AND search)
+    // Support partial word matching: if query is "прим", find "пример", "примерочная", "примерно"
+    const docScores = new Map();
+    const docMatchDetails = new Map(); // Store match details for scoring
+    const docMatchedTerms = new Map(); // Track which query terms matched for each document
+    
+    for (const queryTerm of queryTerms) {
+      let termMatched = false; // Track if this query term matched any document
+      
+      // First, try exact match
+      const exactMatch = this.termIndex.get(queryTerm);
+      if (exactMatch) {
+        termMatched = true;
+        for (const docId of exactMatch) {
+          if (!docScores.has(docId)) {
+            docScores.set(docId, 0);
+            docMatchDetails.set(docId, { exact: 0, prefix: 0, contains: 0 });
+            docMatchedTerms.set(docId, new Set());
+          }
+          const doc = this.documents.get(docId);
+          // Повышенный вес для совпадений в названиях чатов
+          const isTitleMatch = doc && doc.title && doc.title.toLowerCase().includes(queryTerm);
+          const isChatTitleDoc = doc && doc.isChatTitle;
+          const baseScore = isChatTitleDoc ? 5 : (isTitleMatch ? 4 : 3); // Chat title gets highest, title match gets higher
+          docScores.set(docId, docScores.get(docId) + baseScore);
+          docMatchDetails.get(docId).exact++;
+          docMatchedTerms.get(docId).add(queryTerm);
+        }
+      }
+      
+      // Then, find all terms that start with the query term (prefix match)
+      for (const [indexedTerm, docSet] of this.termIndex.entries()) {
+        if (indexedTerm.startsWith(queryTerm) && indexedTerm !== queryTerm) {
+          termMatched = true;
+          for (const docId of docSet) {
+            if (!docScores.has(docId)) {
+              docScores.set(docId, 0);
+              docMatchDetails.set(docId, { exact: 0, prefix: 0, contains: 0 });
+              docMatchedTerms.set(docId, new Set());
+            }
+            // Only add score if this query term hasn't matched this document yet
+            if (!docMatchedTerms.get(docId).has(queryTerm)) {
+              const doc = this.documents.get(docId);
+              // Повышенный вес для совпадений в названиях чатов
+              const isTitleMatch = doc && doc.title && doc.title.toLowerCase().includes(queryTerm);
+              const isChatTitleDoc = doc && doc.isChatTitle;
+              const baseScore = isChatTitleDoc ? 4 : (isTitleMatch ? 3 : 2); // Chat title gets higher, title match gets medium
+              docScores.set(docId, docScores.get(docId) + baseScore);
+              docMatchedTerms.get(docId).add(queryTerm);
+            }
+            docMatchDetails.get(docId).prefix++;
+          }
+        }
+        // Also check if indexed term contains the query term (substring match)
+        else if (indexedTerm.includes(queryTerm) && indexedTerm !== queryTerm && !indexedTerm.startsWith(queryTerm)) {
+          termMatched = true;
+          for (const docId of docSet) {
+            if (!docScores.has(docId)) {
+              docScores.set(docId, 0);
+              docMatchDetails.set(docId, { exact: 0, prefix: 0, contains: 0 });
+              docMatchedTerms.set(docId, new Set());
+            }
+            // Only add score if this query term hasn't matched this document yet
+            if (!docMatchedTerms.get(docId).has(queryTerm)) {
+              const doc = this.documents.get(docId);
+              // Повышенный вес для совпадений в названиях чатов
+              const isTitleMatch = doc && doc.title && doc.title.toLowerCase().includes(queryTerm);
+              const isChatTitleDoc = doc && doc.isChatTitle;
+              const baseScore = isChatTitleDoc ? 3 : (isTitleMatch ? 2 : 1); // Chat title gets higher, title match gets medium
+              docScores.set(docId, docScores.get(docId) + baseScore);
+              docMatchedTerms.get(docId).add(queryTerm);
+            }
+            docMatchDetails.get(docId).contains++;
+          }
+        }
+      }
+    }
+    
+    // Filter documents based on query length
+    // For short queries (1-2 words): use OR logic (at least one match)
+    // For longer queries (3+ words): use AND logic (all words should match, but with partial matching)
+    const isShortQuery = queryTerms.length <= 2;
+    const minRequiredMatches = isShortQuery ? 1 : queryTerms.length;
+    
+    const results = Array.from(docScores.entries())
+      .filter(([docId, score]) => {
+        const matchedTermsSet = docMatchedTerms.get(docId);
+        const matchedTermsCount = matchedTermsSet ? matchedTermsSet.size : 0;
+        return matchedTermsCount >= minRequiredMatches;
+      })
+      .sort((a, b) => {
+        // Primary sort: by score (higher is better)
+        if (b[1] !== a[1]) {
+          return b[1] - a[1];
+        }
+        // Secondary sort: by number of matched terms
+        const termsA = docMatchedTerms.get(a[0]);
+        const termsB = docMatchedTerms.get(b[0]);
+        const countA = termsA ? termsA.size : 0;
+        const countB = termsB ? termsB.size : 0;
+        if (countB !== countA) {
+          return countB - countA;
+        }
+        // Tertiary sort: prefer exact matches
+        const detailsA = docMatchDetails.get(a[0]);
+        const detailsB = docMatchDetails.get(b[0]);
+        if (detailsA && detailsB) {
+          if (detailsB.exact !== detailsA.exact) {
+            return detailsB.exact - detailsA.exact;
+          }
+          if (detailsB.prefix !== detailsA.prefix) {
+            return detailsB.prefix - detailsA.prefix;
+          }
+        }
+        return 0;
+      })
+      .slice(0, limit)
+      .map(([docId]) => {
+        if (enrich) {
+          return this.documents.get(docId);
+        }
+        return docId;
+      })
+      .filter(Boolean);
+    
+    return enrich ? results : results;
+  }
+  
+  // Export index for storage
+  export() {
+    return {
+      documents: Array.from(this.documents.entries()),
+      termIndex: Array.from(this.termIndex.entries()).map(([term, docSet]) => [term, Array.from(docSet)])
+    };
+  }
+  
+  // Import index from storage
+  import(data) {
+    if (!data) return;
+    
+    if (data.documents) {
+      this.documents = new Map(data.documents);
+    }
+    
+    if (data.termIndex) {
+      this.termIndex = new Map(
+        data.termIndex.map(([term, docArray]) => [term, new Set(docArray)])
+      );
+    }
+  }
+  
+  // Get document by ID
+  get(docId) {
+    return this.documents.get(docId);
+  }
+}
+
+const indexCache = new Map();
+
+async function getOrCreateIndex(accountEmail) {
+  if (indexCache.has(accountEmail)) {
+    return indexCache.get(accountEmail);
+  }
+  
+  const index = new SimpleSearchIndex();
+  
+  // Try to load from stored index
+  const storedIndex = await getIndex(accountEmail);
+  if (storedIndex && storedIndex.flexIndexJSON) {
+    try {
+      // Handle both old format (flexIndexJSON.export) and new format (direct data)
+      const indexData = storedIndex.flexIndexJSON.export || storedIndex.flexIndexJSON;
+      // Import serialized index
+      index.import(indexData);
+    } catch (e) {
+      console.error('Error importing stored index, rebuilding:', e);
+      // If import fails, rebuild from messages
+      const chats = await getChatsByAccount(accountEmail);
+      const allMessages = [];
+      for (const chat of chats) {
+        const messages = await getMessagesByChat(chat.chatId);
+        allMessages.push(...messages);
+      }
+      
+      // Пропускаем чаты без сообщений пользователя
+      const chatsWithUserMessages = new Set();
+      for (const msg of allMessages) {
+        if (msg.role === 'user' && msg.text && msg.text.trim().length > 0) {
+          chatsWithUserMessages.add(msg.chatId);
+        }
+      }
+      
+      // Добавляем документы для названий чатов только для чатов с сообщениями пользователя и с названием
+      for (const chat of chats) {
+        const hasTitle = chat.title && chat.title.trim() && chat.title.trim() !== 'Без названия';
+        if (chatsWithUserMessages.has(chat.chatId) && hasTitle) {
+          index.add({
+            id: `chat_${chat.chatId}`,
+            text: '',
+            title: chat.title,
+            chatId: chat.chatId,
+            isChatTitle: true
+          });
+        }
+      }
+      
+      // Добавляем документы для сообщений
+      // Важно: индексируем текст сообщений для поиска по содержимому
+      // Пропускаем чаты без сообщений пользователя и без названия
+      for (const msg of allMessages) {
+        // Индексируем только сообщения из чатов, где есть сообщения пользователя и есть название
+        if (chatsWithUserMessages.has(msg.chatId) && msg.text && msg.text.trim().length > 0) {
+          const chat = chats.find(c => c.chatId === msg.chatId);
+          const hasTitle = chat && chat.title && chat.title.trim() && chat.title.trim() !== 'Без названия';
+          // Индексируем только если у чата есть название
+          if (hasTitle) {
+            index.add({
+              id: msg.id,
+              text: msg.text.trim(), // Убеждаемся, что текст не пустой
+              title: chat.title,
+              chatId: msg.chatId,
+              isChatTitle: false
+            });
+          }
+        }
+      }
+    }
+  } else {
+    // No stored index, build from messages
+    const chats = await getChatsByAccount(accountEmail);
+    const allMessages = [];
+    for (const chat of chats) {
+      const messages = await getMessagesByChat(chat.chatId);
+      allMessages.push(...messages);
+    }
+    
+    // Пропускаем чаты без сообщений пользователя
+    const chatsWithUserMessages = new Set();
+    for (const msg of allMessages) {
+      if (msg.role === 'user' && msg.text && msg.text.trim().length > 0) {
+        chatsWithUserMessages.add(msg.chatId);
+      }
+    }
+    
+    // Добавляем документы для названий чатов только для чатов с сообщениями пользователя и с названием
+    for (const chat of chats) {
+      const hasTitle = chat.title && chat.title.trim() && chat.title.trim() !== 'Без названия';
+      if (chatsWithUserMessages.has(chat.chatId) && hasTitle) {
+        index.add({
+          id: `chat_${chat.chatId}`,
+          text: '',
+          title: chat.title,
+          chatId: chat.chatId,
+          isChatTitle: true
+        });
+      }
+    }
+    
+    // Добавляем документы для сообщений
+    // Важно: индексируем текст сообщений для поиска по содержимому
+    // Пропускаем чаты без сообщений пользователя и без названия
+    for (const msg of allMessages) {
+      // Индексируем только сообщения из чатов, где есть сообщения пользователя и есть название
+      if (chatsWithUserMessages.has(msg.chatId) && msg.text && msg.text.trim().length > 0) {
+        const chat = chats.find(c => c.chatId === msg.chatId);
+        const hasTitle = chat && chat.title && chat.title.trim() && chat.title.trim() !== 'Без названия';
+        // Индексируем только если у чата есть название
+        if (hasTitle) {
+          index.add({
+            id: msg.id,
+            text: msg.text.trim(), // Убеждаемся, что текст не пустой
+            title: chat.title,
+            chatId: msg.chatId,
+            isChatTitle: false
+          });
+        }
+      }
+    }
+  }
+  
+  indexCache.set(accountEmail, index);
+  console.log(`getOrCreateIndex: Cached index for ${accountEmail} with ${index.documents?.size || 0} documents, ${index.termIndex?.size || 0} terms`);
+  return index;
+}
+
+function highlightSearchTerms(text, query) {
+  if (!text || !query) return text;
+  
+  const queryTrimmed = query.trim();
+  if (!queryTrimmed) return text;
+  
+  // Разбиваем запрос на слова
+  const words = queryTrimmed.split(/\s+/).filter(t => t.length > 0);
+  
+  if (words.length > 1) {
+    // Если запрос содержит несколько слов, сначала подсвечиваем всю последовательность
+    const phrase = queryTrimmed;
+    const escapedPhrase = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const phraseRegex = new RegExp(`(${escapedPhrase})`, 'gi');
+    
+    // Находим все вхождения полной фразы
+    const phraseMatches = [];
+    let match;
+    const regex = new RegExp(escapedPhrase, 'gi');
+    while ((match = regex.exec(text)) !== null) {
+      phraseMatches.push({
+        start: match.index,
+        end: match.index + match[0].length,
+        text: match[0]
+      });
+    }
+    
+    if (phraseMatches.length > 0) {
+      // Есть вхождения полной фразы - подсвечиваем только их
+      const parts = [];
+      let lastIndex = 0;
+      
+      for (const phraseMatch of phraseMatches) {
+        // Текст до совпадения - добавляем как есть (без подсветки отдельных слов)
+        if (phraseMatch.start > lastIndex) {
+          parts.push(text.substring(lastIndex, phraseMatch.start));
+        }
+        // Само совпадение - подсвечиваем
+        parts.push(`<mark>${phraseMatch.text}</mark>`);
+        lastIndex = phraseMatch.end;
+      }
+      
+      // Оставшийся текст после последнего совпадения
+      if (lastIndex < text.length) {
+        parts.push(text.substring(lastIndex));
+      }
+      
+      return parts.join('');
+    } else {
+      // Если полная фраза не найдена, подсвечиваем отдельные слова
+      return highlightWordsInText(text, words);
+    }
+  } else {
+    // Одно слово - просто подсвечиваем его
+    const word = words[0];
+    const escapedWord = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(${escapedWord})`, 'gi');
+    return text.replace(regex, '<mark>$1</mark>');
+  }
+}
+
+/**
+ * Подсвечивает отдельные слова в тексте
+ * @param {string} text - Текст для обработки
+ * @param {string[]} words - Массив слов для подсветки
+ * @returns {string} - Текст с подсвеченными словами
+ */
+function highlightWordsInText(text, words) {
+  let result = text;
+  
+  for (const word of words) {
+    const escapedWord = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(${escapedWord})`, 'gi');
+    result = result.replace(regex, '<mark>$1</mark>');
+  }
+  
+  return result;
+}
+
+/**
+ * Обрезает текст до указанной длины, центрируя вокруг найденного совпадения
+ * @param {string} html - HTML текст с разметкой
+ * @param {number} maxLength - Максимальная длина в символах
+ * @returns {string} - Обрезанный текст с контекстом вокруг совпадения
+ */
+function truncateHtml(html, maxLength = 150) {
+  if (!html) return '';
+  
+  // Удаляем HTML теги для подсчета длины текста
+  const plainText = html.replace(/<[^>]*>/g, '');
+  
+  if (plainText.length <= maxLength) {
+    return html;
+  }
+  
+  // Находим первое совпадение (подсвеченный текст)
+  const markStartRegex = /<mark[^>]*>/gi;
+  const markEndRegex = /<\/mark>/gi;
+  
+  let firstMarkStart = -1;
+  let firstMarkEnd = -1;
+  let markStartPos = 0;
+  
+  // Находим позицию первого <mark> в исходном HTML
+  const markStartMatch = markStartRegex.exec(html);
+  if (markStartMatch) {
+    firstMarkStart = markStartMatch.index;
+    markStartPos = firstMarkStart;
+    
+    // Находим позицию соответствующего </mark>
+    const htmlAfterMark = html.substring(firstMarkStart + markStartMatch[0].length);
+    const markEndMatch = markEndRegex.exec(htmlAfterMark);
+    if (markEndMatch) {
+      firstMarkEnd = firstMarkStart + markStartMatch[0].length + markEndMatch.index;
+    }
+  }
+  
+  // Если нет подсветки, обрезаем с начала
+  if (firstMarkStart === -1) {
+    return truncateFromStart(html, maxLength);
+  }
+  
+  // Вычисляем позицию совпадения в plainText (без HTML тегов)
+  const textBeforeMark = html.substring(0, firstMarkStart).replace(/<[^>]*>/g, '');
+  const matchStartInPlainText = textBeforeMark.length;
+  const matchText = html.substring(firstMarkStart + 5, firstMarkEnd).replace(/<[^>]*>/g, '');
+  const matchEndInPlainText = matchStartInPlainText + matchText.length;
+  
+  // Вычисляем центр совпадения
+  const matchCenter = Math.floor((matchStartInPlainText + matchEndInPlainText) / 2);
+  
+  // Вычисляем границы сниппета (центрируем вокруг совпадения)
+  const contextBefore = Math.floor(maxLength * 0.4); // 40% до совпадения
+  const contextAfter = Math.floor(maxLength * 0.6); // 60% после совпадения
+  
+  let snippetStart = Math.max(0, matchCenter - contextBefore);
+  let snippetEnd = Math.min(plainText.length, matchCenter + contextAfter);
+  
+  // Расширяем до границ, если есть место
+  if (snippetEnd - snippetStart < maxLength) {
+    const remaining = maxLength - (snippetEnd - snippetStart);
+    snippetStart = Math.max(0, snippetStart - Math.floor(remaining / 2));
+    snippetEnd = Math.min(plainText.length, snippetEnd + Math.ceil(remaining / 2));
+  }
+  
+  // Обрезаем по границам слов
+  if (snippetStart > 0) {
+    const spaceBefore = plainText.lastIndexOf(' ', snippetStart);
+    if (spaceBefore > snippetStart - 20) {
+      snippetStart = spaceBefore + 1;
+    }
+  }
+  
+  if (snippetEnd < plainText.length) {
+    const spaceAfter = plainText.indexOf(' ', snippetEnd);
+    if (spaceAfter !== -1 && spaceAfter < snippetEnd + 20) {
+      snippetEnd = spaceAfter;
+    }
+  }
+  
+  // Извлекаем нужный фрагмент из HTML, сохраняя разметку
+  return extractHtmlFragment(html, snippetStart, snippetEnd, plainText);
+}
+
+/**
+ * Обрезает HTML с начала до указанной длины
+ */
+function truncateFromStart(html, maxLength) {
+  const plainText = html.replace(/<[^>]*>/g, '');
+  
+  if (plainText.length <= maxLength) {
+    return html;
+  }
+  
+  let result = '';
+  let currentLength = 0;
+  let inTag = false;
+  let tagBuffer = '';
+  
+  for (let i = 0; i < html.length; i++) {
+    const char = html[i];
+    
+    if (char === '<') {
+      inTag = true;
+      tagBuffer = '<';
+    } else if (char === '>') {
+      inTag = false;
+      tagBuffer += '>';
+      result += tagBuffer;
+      tagBuffer = '';
+    } else if (inTag) {
+      tagBuffer += char;
+    } else {
+      if (currentLength >= maxLength) {
+        break;
+      }
+      result += char;
+      currentLength++;
+    }
+  }
+  
+  if (currentLength < plainText.length) {
+    const lastSpace = result.lastIndexOf(' ');
+    if (lastSpace > maxLength * 0.8) {
+      result = result.substring(0, lastSpace);
+    }
+    result += '…';
+  }
+  
+  return result;
+}
+
+/**
+ * Извлекает фрагмент HTML, соответствующий указанному диапазону в plainText
+ */
+function extractHtmlFragment(html, startPos, endPos, plainText) {
+  // Проходим по HTML и отслеживаем позиции в plainText
+  let result = '';
+  let plainTextPos = 0;
+  let inTag = false;
+  let tagBuffer = '';
+  let started = false;
+  
+  for (let i = 0; i < html.length; i++) {
+    const char = html[i];
+    
+    if (char === '<') {
+      inTag = true;
+      tagBuffer = '<';
+    } else if (char === '>') {
+      inTag = false;
+      tagBuffer += '>';
+      
+      // Добавляем тег, если мы в нужном диапазоне
+      if (started || plainTextPos >= startPos) {
+        if (!started && plainTextPos >= startPos) {
+          started = true;
+        }
+        result += tagBuffer;
+      }
+      
+      tagBuffer = '';
+    } else if (inTag) {
+      tagBuffer += char;
+    } else {
+      // Обычный текст
+      if (plainTextPos >= startPos && plainTextPos < endPos) {
+        if (!started) {
+          started = true;
+        }
+        result += char;
+      }
+      
+      plainTextPos++;
+      
+      if (plainTextPos >= endPos) {
+        break;
+      }
+    }
+  }
+  
+  // Добавляем многоточие в начале и конце, если текст обрезан
+  if (startPos > 0) {
+    result = '…' + result;
+  }
+  if (endPos < plainText.length) {
+    result = result + '…';
+  }
+  
+  return result;
+}
+
+// ========== Indexing Logic ==========
+async function indexChat(accountEmail, chatId, sendProgress, maxRetries = 3, reusableTab = null) {
+  let attempt = 0;
+  const baseDelay = 1000; // Базовая задержка 1 секунда
+  let tab = null;
+  let tabCreatedByUs = false; // Флаг, что вкладка создана нами
+  let isReusable = !!reusableTab; // Флаг, что вкладка переиспользуется
+  let response = null;
+  
+  while (attempt < maxRetries) {
+    try {
+    const chat = await getChat(chatId);
+    if (!chat) {
+      throw new Error(`Chat ${chatId} not found`);
+    }
+    
+      // Сбрасываем флаг при новой попытке (если вкладка уже была создана ранее)
+      if (attempt > 0 && tabCreatedByUs) {
+        // Закрываем предыдущую вкладку при повторной попытке
+        try {
+          if (tab && tab.id) {
+            await chrome.tabs.remove(tab.id);
+          }
+        } catch (e) {
+          // Игнорируем ошибки
+        }
+        tab = null;
+        tabCreatedByUs = false;
+      }
+      
+      // Ищем существующую вкладку с нужным URL
+    const tabs = await chrome.tabs.query({ url: chat.url });
+    if (tabs.length > 0) {
+      tab = tabs[0];
+        // Проверяем, что вкладка все еще существует и загружена
+        try {
+          const tabInfo = await chrome.tabs.get(tab.id);
+          if (tabInfo.status !== 'complete') {
+            // Вкладка еще загружается, ждем
+      await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        } catch (e) {
+          // Вкладка была закрыта, создаем новую
+          tab = null;
+        }
+      }
+      
+      // Если есть переиспользуемая вкладка - обновляем её URL
+      if (isReusable && reusableTab && reusableTab.id) {
+        try {
+          // Проверяем, что вкладка еще существует
+          const tabInfo = await chrome.tabs.get(reusableTab.id);
+          await chrome.tabs.update(reusableTab.id, { url: chat.url });
+          tab = reusableTab;
+          // Ждем загрузки новой страницы
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          // Дополнительно ждем, пока страница полностью загрузится
+          let loadRetries = 7;
+          while (loadRetries > 0) {
+            try {
+              const updatedTabInfo = await chrome.tabs.get(tab.id);
+              if (updatedTabInfo.status === 'complete' && updatedTabInfo.url === chat.url) {
+                break;
+              }
+              await new Promise(resolve => setTimeout(resolve, 300));
+            } catch (e) {
+              // Вкладка была закрыта
+              throw new Error('Tab was closed during loading');
+            }
+            loadRetries--;
+          }
+        } catch (e) {
+          // Если не удалось обновить вкладку, создаем новую
+          console.warn(`indexChat: Could not reuse tab, creating new one:`, e.message);
+          tab = null;
+          isReusable = false;
+        }
+      }
+      
+      // Если вкладки нет, сначала ищем существующие вкладки Copilot для переиспользования
+      if (!tab) {
+        // Ищем открытые вкладки Copilot (они имеют сессию)
+        const copilotTabs = await chrome.tabs.query({ url: "*://copilot.microsoft.com/*" });
+        if (copilotTabs.length > 0) {
+          // Используем первую открытую вкладку Copilot (она имеет сессию)
+          tab = copilotTabs[0];
+          console.log(`indexChat: Reusing existing Copilot tab ${tab.id} for chat ${chatId}`);
+          // Обновляем URL на нужный чат
+          await chrome.tabs.update(tab.id, { url: chat.url });
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        } else {
+          // Если нет открытых вкладок, создаем новую
+          // ВАЖНО: создаем активной, чтобы она могла получить сессию
+          tab = await chrome.tabs.create({ 
+            url: chat.url, 
+            active: true, // Активируем для получения сессии
+            pinned: false
+          });
+          console.log(`indexChat: Created new tab ${tab.id} for chat ${chatId} (active to get session)`);
+          tabCreatedByUs = true;
+          // Деактивируем после небольшой задержки, чтобы сессия успела установиться
+          setTimeout(() => {
+            chrome.tabs.update(tab.id, { active: false }).catch(() => {});
+          }, 2000);
+          // Ждем загрузки страницы
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          // Дополнительно ждем, пока страница полностью загрузится
+          let loadRetries = 7;
+          while (loadRetries > 0) {
+            try {
+              const tabInfo = await chrome.tabs.get(tab.id);
+              if (tabInfo.status === 'complete') {
+                break;
+              }
+              await new Promise(resolve => setTimeout(resolve, 300));
+            } catch (e) {
+              // Вкладка была закрыта
+              throw new Error('Tab was closed during loading');
+            }
+            loadRetries--;
+          }
+        }
+      }
+      
+      // Если вкладка уже существует (найдена ранее), обновляем её URL
+      if (tab && !tabCreatedByUs && tab.id) {
+        // Переиспользуем существующую вкладку - меняем URL
+        try {
+          await chrome.tabs.update(tab.id, { url: chat.url });
+          // Ждем загрузки новой страницы
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          // Дополнительно ждем, пока страница полностью загрузится
+          let loadRetries = 7;
+          while (loadRetries > 0) {
+            try {
+              const tabInfo = await chrome.tabs.get(tab.id);
+              if (tabInfo.status === 'complete' && tabInfo.url === chat.url) {
+                break;
+              }
+              await new Promise(resolve => setTimeout(resolve, 300));
+            } catch (e) {
+              // Вкладка была закрыта
+              throw new Error('Tab was closed during loading');
+            }
+            loadRetries--;
+          }
+        } catch (e) {
+          // Если не удалось обновить вкладку, создаем новую
+          console.warn(`indexChat: Could not reuse tab, creating new one:`, e.message);
+          // Ищем существующие вкладки Copilot
+          const copilotTabs = await chrome.tabs.query({ url: "*://copilot.microsoft.com/*" });
+          if (copilotTabs.length > 0) {
+            tab = copilotTabs[0];
+            await chrome.tabs.update(tab.id, { url: chat.url });
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          } else {
+            // Создаем новую активную вкладку для получения сессии
+            tab = await chrome.tabs.create({ 
+              url: chat.url, 
+              active: true, // Активируем для получения сессии
+              pinned: false
+            });
+            tabCreatedByUs = true;
+            setTimeout(() => {
+              chrome.tabs.update(tab.id, { active: false }).catch(() => {});
+            }, 2000);
+            await new Promise(resolve => setTimeout(resolve, 2000));
+          }
+        }
+      }
+      
+      // Ждем, пока страница полностью загрузится и content script будет готов
+      // Увеличиваем начальную задержку, чтобы content script успел загрузиться
+      await new Promise(resolve => setTimeout(resolve, 2500));
+      
+      // Используем объединенный запрос: проверка готовности + получение контента
+      // Это позволяет избежать двойных запросов и проблем с таймингом
+      let maxAttempts = 15; // Максимум попыток (увеличено, так как ждем дольше между попытками)
+      const waitDelay = 500; // Фиксированная задержка 500ms между проверками, если контент не готов
+      
+      while (maxAttempts > 0) {
+        try {
+          // Объединенный запрос: проверяем готовность и получаем контент одновременно
+          const checkResponse = await chrome.tabs.sendMessage(tab.id, { 
+            action: 'checkContentReadyAndGet',
+            chatId: chatId 
+          });
+          
+          if (checkResponse && checkResponse.success) {
+            if (checkResponse.ready && checkResponse.messages) {
+              // Контент готов и получен - используем его и выходим
+              console.log(`indexChat: Content ready and retrieved (${checkResponse.messageCount} messages, ${checkResponse.userMessageCount} user messages)`);
+              response = checkResponse;
+              break;
+            } else {
+              // Контент еще не готов - ждем 500ms и проверяем снова
+              console.log(`indexChat: Content not ready yet (${checkResponse.messageCount || 0} messages), waiting 500ms before next check... (${maxAttempts} attempts left)`);
+              await new Promise(resolve => setTimeout(resolve, waitDelay));
+              // Продолжаем цикл для следующей проверки
+            }
+          } else {
+            // Ошибка в ответе, ждем и пробуем снова
+            console.log(`indexChat: Invalid response, waiting 500ms before retry... (${maxAttempts} attempts left)`);
+            await new Promise(resolve => setTimeout(resolve, waitDelay));
+          }
+          
+        } catch (error) {
+          const errorMsg = error.message || String(error);
+          
+          // Ошибки соединения - content script может быть еще не готов
+          if (errorMsg.includes('Could not establish connection') || 
+              errorMsg.includes('Receiving end does not exist') ||
+              errorMsg.includes('Extension context invalidated') ||
+              errorMsg.includes('message port closed')) {
+            console.log(`indexChat: Connection error (content script may not be ready), waiting 500ms... (${maxAttempts} attempts left)`);
+            await new Promise(resolve => setTimeout(resolve, waitDelay));
+          } else {
+            // Другие ошибки - пробрасываем
+            throw error;
+          }
+        }
+        
+        maxAttempts--;
+      }
+      
+      // Если после всех попыток не получили контент, пробуем получить через обычный запрос
+      if (!response || !response.success || !response.messages) {
+        console.log(`indexChat: Trying fallback getChatContent after ready checks`);
+        let retries = 3;
+        
+        while (retries > 0) {
+          try {
+            response = await chrome.tabs.sendMessage(tab.id, { 
+              action: 'getChatContent',
+              chatId: chatId 
+            });
+            
+            if (response && response.success) {
+              break;
+            }
+            
+            if (response && response.error && response.error.includes('Chat ID not found')) {
+              console.warn(`indexChat: Chat ID not found in URL for ${chatId}, but we provided it. Retrying...`);
+              await new Promise(resolve => setTimeout(resolve, 500));
+            } else if (response && response.error) {
+              throw new Error(response.error);
+            }
+          } catch (error) {
+            const errorMsg = error.message || String(error);
+            
+            if (errorMsg.includes('Could not establish connection') || 
+                errorMsg.includes('Receiving end does not exist') ||
+                errorMsg.includes('Extension context invalidated') ||
+                errorMsg.includes('message port closed')) {
+              console.log(`indexChat: Connection error in fallback, waiting... (${retries} retries left)`);
+              await new Promise(resolve => setTimeout(resolve, 500));
+            } else {
+              throw error;
+            }
+          }
+          
+          retries--;
+        }
+      }
+    
+    if (!response || !response.success || !response.messages) {
+        const errorMsg = response?.error || 'Failed to get chat content';
+        console.error(`indexChat: Failed to get chat content for ${chatId}:`, errorMsg);
+        if (response?.debug) {
+          console.error('indexChat: Debug info:', response.debug);
+        }
+        
+        // Проверяем, является ли это ошибкой аутентификации
+        if (errorMsg.includes('Access token is empty') || errorMsg.includes('InvalidAuthenticationToken')) {
+          throw new Error(`Authentication error: Access token is empty. Please ensure you are logged in to Copilot in an active tab.`);
+        }
+        
+        throw new Error(errorMsg);
+      }
+      
+      // Если дошли сюда, значит успешно получили данные
+      break; // Выходим из цикла попыток
+      
+    } catch (error) {
+      attempt++;
+      const errorMsg = error.message || String(error);
+      
+      // Проверяем, является ли это ошибкой аутентификации
+      const isAuthError = errorMsg.includes('Access token is empty') || 
+                         errorMsg.includes('InvalidAuthenticationToken') ||
+                         errorMsg.includes('Authentication error') ||
+                         errorMsg.includes('Authentication failed');
+      
+      if (isAuthError) {
+        // Ошибка аутентификации - не повторяем, пробрасываем сразу
+        console.error(`indexChat: Authentication error for chat ${chatId}. The tab may not have a valid session.`);
+        throw new Error(`Authentication failed: Please ensure you are logged in to Copilot and have an active tab open. Background tabs cannot access the session.`);
+      }
+      
+      // Проверяем, является ли это ошибкой соединения
+      const isConnectionError = errorMsg.includes('Could not establish connection') ||
+                                errorMsg.includes('Receiving end does not exist') ||
+                                errorMsg.includes('Extension context invalidated') ||
+                                errorMsg.includes('message port closed') ||
+                                errorMsg.includes('No tab with id');
+      
+      if (isConnectionError && attempt < maxRetries) {
+        const delay = baseDelay * Math.pow(2, attempt - 1); // Экспоненциальная задержка
+        console.warn(`indexChat: Connection error (attempt ${attempt}/${maxRetries}), retrying in ${delay}ms:`, errorMsg);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue; // Пробуем еще раз
+      } else {
+        // Не ошибка соединения или исчерпаны попытки
+        throw error;
+      }
+    }
+  }
+  
+  // Если мы здесь, значит успешно получили response
+  try {
+    const chat = await getChat(chatId);
+    
+    if (!chat) {
+      throw new Error(`Chat ${chatId} not found in database`);
+    }
+    
+    const messages = response.messages || [];
+    console.log(`indexChat: Got ${messages.length} messages for chat ${chatId}, title: "${chat.title}"`);
+    
+    // Проверяем, есть ли название у чата
+    const hasTitle = chat.title && chat.title.trim() && chat.title.trim() !== 'Без названия';
+    
+    // Если нет названия или название "Без названия", пропускаем индексацию
+    if (!hasTitle) {
+      console.log(`indexChat: Skipping chat ${chatId} - no title or title is "Без названия" (title: "${chat.title}")`);
+      if (sendProgress) {
+        chrome.runtime.sendMessage({
+          type: 'INDEX_PROGRESS',
+          chatId,
+          status: 'skipped',
+          reason: 'No title'
+        }).catch(() => {});
+      }
+      
+      // Закрываем вкладку, если она была создана нами и не переиспользуется
+      if (tabCreatedByUs && !isReusable && tab && tab.id) {
+        try {
+          await chrome.tabs.remove(tab.id);
+          console.log(`indexChat: Closed background tab for skipped chat ${chatId}`);
+        } catch (e) {
+          console.log(`indexChat: Could not close tab ${tab.id} for skipped chat:`, e.message);
+        }
+      }
+      
+      return { 
+        messageCount: 0, 
+        skipped: true,
+        reusableTab: (isReusable && tab) ? tab : null
+      };
+    }
+    
+    // Проверяем, есть ли в чате сообщения пользователя (диалог)
+    const userMessages = messages.filter(msg => msg.role === 'user' && msg.text && msg.text.trim().length > 0);
+    console.log(`indexChat: Found ${userMessages.length} user messages out of ${messages.length} total messages for chat ${chatId}`);
+    
+    // Если нет сообщений пользователя, пропускаем индексацию
+    if (userMessages.length === 0) {
+      console.log(`indexChat: Skipping chat ${chatId} - no user messages found (total messages: ${messages.length})`);
+      if (sendProgress) {
+        chrome.runtime.sendMessage({
+          type: 'INDEX_PROGRESS',
+          chatId,
+          status: 'skipped',
+          reason: 'No user messages'
+        }).catch(() => {});
+      }
+      
+      // Закрываем вкладку, если она была создана нами и не переиспользуется
+      if (tabCreatedByUs && !isReusable && tab && tab.id) {
+        try {
+          await chrome.tabs.remove(tab.id);
+          console.log(`indexChat: Closed background tab for skipped chat ${chatId}`);
+        } catch (e) {
+          console.log(`indexChat: Could not close tab ${tab.id} for skipped chat:`, e.message);
+        }
+      }
+      
+      return { 
+        messageCount: 0, 
+        skipped: true,
+        reusableTab: (isReusable && tab) ? tab : null
+      };
+    }
+    
+    console.log(`indexChat: Starting indexing for chat ${chatId} with ${messages.length} messages`);
+    
+    await deleteMessagesByChat(chatId);
+    
+    // Используем батчинг для сохранения всех сообщений одной транзакцией
+    await createMessagesBatch(messages);
+    console.log(`indexChat: Saved ${messages.length} messages to database for chat ${chatId}`);
+    
+    const index = await getOrCreateIndex(accountEmail);
+    console.log(`indexChat: Got index for account ${accountEmail}, current documents: ${index.documents?.size || 0}, terms: ${index.termIndex?.size || 0}`);
+    
+    // Удаляем старые документы для этого чата из индекса перед добавлением новых
+    // Это предотвращает накопление дубликатов при повторной индексации
+    const removedCount = index.removeByChatId(chatId);
+    if (removedCount > 0) {
+      console.log(`indexChat: Removed ${removedCount} old documents from index for chat ${chatId}`);
+    }
+    
+    // Добавляем отдельный документ для чата (название чата)
+    // Это позволяет искать по названиям чатов напрямую
+    if (chat.title && chat.title.trim()) {
+      index.add({
+        id: `chat_${chat.chatId}`,
+        text: '', // Название чата в title, не в text
+        title: chat.title,
+        chatId: chat.chatId,
+        isChatTitle: true // Флаг для повышенного приоритета
+      });
+    }
+    
+    // Добавляем документы для сообщений
+    // Важно: индексируем текст сообщений для поиска по содержимому
+    const documents = messages
+      .filter(msg => msg.text && msg.text.trim().length > 0) // Фильтруем пустые сообщения
+      .map(msg => ({
+      id: msg.id,
+        text: msg.text.trim(), // Убеждаемся, что текст не пустой
+      title: chat.title,
+        chatId: chat.chatId,
+        isChatTitle: false
+    }));
+    
+    let indexedDocs = 0;
+    for (const doc of documents) {
+      // Индексируем только если есть текст для поиска
+      if (doc.text && doc.text.length > 0) {
+        index.add(doc);
+        indexedDocs++;
+      }
+    }
+    console.log(`indexChat: Added ${indexedDocs} documents to index for chat ${chatId}`);
+    console.log(`indexChat: Index state after adding - documents: ${index.documents?.size || 0}, terms: ${index.termIndex?.size || 0}`);
+    
+    await updateChat(chatId, { lastIndexedUTC: toUTCString() });
+    console.log(`indexChat: Successfully indexed chat ${chatId}`);
+    
+    // Сохраняем индекс после каждого чата, чтобы не потерять прогресс
+    try {
+      if (typeof index.export === 'function') {
+        const serializedIndex = index.export();
+        console.log(`indexChat: Exported index - documents array length: ${serializedIndex?.documents?.length || 0}, termIndex array length: ${serializedIndex?.termIndex?.length || 0}`);
+        
+        if (serializedIndex && (serializedIndex.documents || serializedIndex.termIndex)) {
+          // Проверяем, что есть данные для сохранения
+          const hasDocuments = serializedIndex.documents && serializedIndex.documents.length > 0;
+          const hasTerms = serializedIndex.termIndex && serializedIndex.termIndex.length > 0;
+          
+          if (hasDocuments || hasTerms) {
+            await saveIndex(accountEmail, serializedIndex);
+            console.log(`indexChat: Saved index to database for account ${accountEmail} (${serializedIndex.documents?.length || 0} documents, ${serializedIndex.termIndex?.length || 0} terms)`);
+          } else {
+            console.warn(`indexChat: Index export is empty - documents: ${hasDocuments}, terms: ${hasTerms}`);
+          }
+        } else {
+          console.warn(`indexChat: Index export returned invalid data:`, serializedIndex);
+        }
+      } else {
+        console.warn(`indexChat: Index does not have export method, type: ${typeof index.export}`);
+      }
+    } catch (e) {
+      console.error(`indexChat: Error saving index:`, e);
+      console.error(`indexChat: Error stack:`, e.stack);
+      // Не пробрасываем ошибку - индексация успешна, просто не сохранили
+    }
+    
+    // Закрываем вкладку, если она была создана нами (в фоновом режиме) и не переиспользуется
+    // НЕ закрываем, если вкладка переиспользуется - она будет закрыта в startIndexing
+    if (tabCreatedByUs && !isReusable && tab && tab.id) {
+      try {
+        await chrome.tabs.remove(tab.id);
+        console.log(`indexChat: Closed background tab for chat ${chatId}`);
+        tab = null; // Обнуляем ссылку на закрытую вкладку
+      } catch (e) {
+        // Игнорируем ошибки при закрытии (вкладка могла быть закрыта пользователем)
+        console.log(`indexChat: Could not close tab ${tab.id}:`, e.message);
+      }
+    }
+    
+    if (sendProgress) {
+      chrome.runtime.sendMessage({
+        type: 'INDEX_PROGRESS',
+        chatId,
+        status: 'completed',
+        messageCount: messages.length
+      }).catch(() => {});
+    }
+    
+    // Возвращаем информацию о вкладке для переиспользования
+    // Если вкладка переиспользуется, возвращаем её для следующего чата
+    // Если вкладка была создана нами и может быть переиспользована, возвращаем её
+    return { 
+      messageCount: messages.length,
+      reusableTab: (isReusable && tab) ? tab : ((tabCreatedByUs && tab) ? tab : null)
+    };
+  } catch (error) {
+    console.error(`Error indexing chat ${chatId}:`, error);
+    
+    // Закрываем вкладку при ошибке, если она была создана нами и не переиспользуется
+    if (tabCreatedByUs && !isReusable && tab && tab.id) {
+      try {
+        await chrome.tabs.remove(tab.id);
+        console.log(`indexChat: Closed background tab after error for chat ${chatId}`);
+        tab = null;
+      } catch (e) {
+        // Игнорируем ошибки при закрытии
+        console.log(`indexChat: Could not close tab ${tab?.id} after error:`, e.message);
+      }
+    }
+    
+    // Если вкладка переиспользуется, не закрываем её - она будет закрыта в startIndexing
+    
+    if (sendProgress) {
+      chrome.runtime.sendMessage({
+        type: 'INDEX_PROGRESS',
+        chatId,
+        status: 'error',
+        error: error.message
+      }).catch(() => {});
+    }
+    throw error;
+  }
+}
+
+async function getDatabaseDiagnostics(accountEmail) {
+  const db = await initDB();
+  
+  // Чаты для текущего аккаунта (это правильное число уникальных чатов)
+  const accountChats = await getChatsByAccount(accountEmail);
+  
+  // Все аккаунты
+  const allAccounts = await new Promise((resolve, reject) => {
+    const transaction = db.transaction(['accounts'], 'readonly');
+    const store = transaction.objectStore('accounts');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+  
+  // Чаты по аккаунтам
+  const chatsByAccount = {};
+  let totalUniqueChats = 0;
+  for (const account of allAccounts) {
+    const chats = await getChatsByAccount(account.email);
+    chatsByAccount[account.email] = chats.length;
+    totalUniqueChats += chats.length;
+  }
+  
+  // Общее количество уникальных чатов (сумма по всем аккаунтам)
+  // Это правильное число, так как каждый чат принадлежит одному аккаунту
+  const allChatsCount = totalUniqueChats;
+  
+  return {
+    accountEmail,
+    totalChats: allChatsCount, // Теперь это сумма уникальных чатов по всем аккаунтам
+    accountChats: accountChats.length,
+    totalAccounts: allAccounts.length,
+    accounts: allAccounts.map(a => a.email),
+    chatsByAccount
+  };
+}
+
+// Сохранение состояния индексации
+async function saveIndexingState(accountEmail, currentIndex, totalCount, lastChatId) {
+  try {
+    await chrome.storage.local.set({
+      [`indexing_${accountEmail}`]: {
+        currentIndex,
+        totalCount,
+        lastChatId,
+        timestamp: Date.now()
+      }
+    });
+  } catch (error) {
+    console.error('Error saving indexing state:', error);
+  }
+}
+
+// Получение состояния индексации
+async function getIndexingState(accountEmail) {
+  try {
+    const key = `indexing_${accountEmail}`;
+    const result = await chrome.storage.local.get([key]);
+    return result[key] || null;
+  } catch (error) {
+    console.error('Error getting indexing state:', error);
+    return null;
+  }
+}
+
+// Очистка состояния индексации
+async function clearIndexingState(accountEmail) {
+  try {
+    await chrome.storage.local.remove([`indexing_${accountEmail}`]);
+  } catch (error) {
+    console.error('Error clearing indexing state:', error);
+  }
+}
+
+/**
+ * Получить чаты, которые нужно проиндексировать
+ * @param {Array} chats - Все чаты аккаунта
+ * @param {boolean} incremental - Инкрементальная индексация (только непроиндексированные/обновленные)
+ * @returns {Array} - Чаты, требующие индексации
+ */
+function getChatsNeedingIndexing(chats, incremental = true) {
+  if (!incremental) {
+    // Полная переиндексация - индексируем все чаты
+    return chats;
+  }
+  
+  // Инкрементальная индексация - только непроиндексированные или обновленные
+  return chats.filter(chat => {
+    // Если чат не проиндексирован
+    if (!chat.lastIndexedUTC) {
+      return true;
+    }
+    
+    // Если чат обновлен после индексации
+    const updatedDate = new Date(chat.updatedAtUTC);
+    const indexedDate = new Date(chat.lastIndexedUTC);
+    return updatedDate > indexedDate;
+  });
+}
+
+async function startIndexing(accountEmail, incremental = false, resume = false, sendProgress = true, selectedChatIds = null) {
+  // Устанавливаем флаг активной индексации и сбрасываем флаг остановки
+  isIndexingActive = true;
+  shouldStopIndexing = false;
+  
+  try {
+    if (!accountEmail) {
+      throw new Error('Email аккаунта не указан');
+    }
+    
+    const account = await getAccount(accountEmail);
+    if (!account) {
+      await createAccount(accountEmail);
+    }
+    
+    const allChats = await getChatsByAccount(accountEmail);
+    
+    if (allChats.length === 0) {
+      // Получаем диагностическую информацию
+      const diagnostics = await getDatabaseDiagnostics(accountEmail);
+      
+      let errorMessage = `Чаты не найдены для аккаунта "${accountEmail}".\n\n`;
+      errorMessage += `Диагностика:\n`;
+      errorMessage += `- Всего чатов в БД: ${diagnostics.totalChats}\n`;
+      errorMessage += `- Чатов для "${accountEmail}": ${diagnostics.accountChats}\n`;
+      errorMessage += `- Всего аккаунтов: ${diagnostics.totalAccounts}\n`;
+      
+      if (diagnostics.totalChats === 0) {
+        errorMessage += `\nПроблема: В базе данных нет чатов.\n`;
+        errorMessage += `Решение: Откройте страницу Copilot (https://copilot.microsoft.com), дождитесь полной загрузки страницы и списка чатов. Расширение автоматически сохранит чаты в базу данных.`;
+      } else if (diagnostics.accounts.length > 0) {
+        errorMessage += `\nПроблема: Чаты найдены, но для другого аккаунта.\n`;
+        errorMessage += `Найдены чаты для аккаунтов:\n`;
+        for (const [email, count] of Object.entries(diagnostics.chatsByAccount)) {
+          errorMessage += `  - ${email}: ${count} чатов\n`;
+        }
+        errorMessage += `\nРешение: Убедитесь, что вы используете правильный email аккаунта. Или откройте Copilot с нужным аккаунтом и дождитесь загрузки чатов.`;
+      } else {
+        errorMessage += `\nПроблема: Чаты есть в БД, но не привязаны к аккаунтам.\n`;
+        errorMessage += `Решение: Откройте страницу Copilot и дождитесь загрузки списка чатов.`;
+      }
+      
+      throw new Error(errorMessage);
+    }
+    
+    // Если указаны выбранные чаты, используем их напрямую, иначе фильтруем
+    let chatsToIndex;
+    if (selectedChatIds && selectedChatIds.length > 0) {
+      // Используем выбранные чаты напрямую
+      const selectedSet = new Set(selectedChatIds);
+      chatsToIndex = allChats.filter(chat => selectedSet.has(chat.chatId));
+      console.log(`startIndexing: Using ${chatsToIndex.length} selected chats out of ${allChats.length} total`);
+    } else {
+      // Фильтруем чаты на основе их индивидуального lastIndexedUTC
+      chatsToIndex = getChatsNeedingIndexing(allChats, incremental);
+      console.log(`startIndexing: Found ${allChats.length} total chats, ${chatsToIndex.length} need indexing (incremental: ${incremental})`);
+    }
+    
+    if (chatsToIndex.length === 0) {
+      console.log('startIndexing: No chats need indexing');
+      chrome.runtime.sendMessage({
+        type: 'INDEX_DONE',
+        accountEmail,
+        indexedCount: 0,
+        totalCount: allChats.length,
+        errorCount: 0
+      }).catch(() => {});
+      return { 
+        indexedCount: 0, 
+        totalCount: allChats.length,
+        errorCount: 0
+      };
+    }
+    
+    // Проверяем, есть ли сохраненное состояние индексации
+    let startIndex = 0;
+    if (resume) {
+      const savedState = await getIndexingState(accountEmail);
+      if (savedState && savedState.currentIndex < chatsToIndex.length) {
+        // Проверяем, не устарело ли состояние (больше 1 часа)
+        const stateAge = Date.now() - savedState.timestamp;
+        if (stateAge < 3600000) { // 1 час
+          startIndex = savedState.currentIndex;
+          console.log(`Resuming indexing from chat ${startIndex + 1} of ${chatsToIndex.length}`);
+          
+          // Пропускаем уже проиндексированные чаты
+          // (те, у которых есть lastIndexedUTC и он недавний)
+          while (startIndex < chatsToIndex.length) {
+            const chat = chatsToIndex[startIndex];
+            if (!chat.lastIndexedUTC) {
+              break; // Этот чат не проиндексирован, начинаем с него
+            }
+            // Проверяем, не слишком ли старый индекс (больше 1 дня - переиндексируем)
+            const indexedDate = new Date(chat.lastIndexedUTC);
+            const daysSinceIndexed = (Date.now() - indexedDate.getTime()) / (1000 * 60 * 60 * 24);
+            if (daysSinceIndexed > 1) {
+              break; // Индекс устарел, переиндексируем
+            }
+            startIndex++;
+          }
+        }
+      }
+    }
+    
+    let successCount = 0;
+    let errorCount = 0;
+    const errors = [];
+    
+    // Переиспользуем одну вкладку для всех чатов (оптимизация)
+    let reusableTab = null;
+    let reusableTabCreated = false;
+    
+    for (let i = startIndex; i < chatsToIndex.length; i++) {
+      // Проверяем флаг остановки индексации
+      if (shouldStopIndexing) {
+        console.log('Indexing stopped by user');
+        await saveIndexingState(accountEmail, i, chatsToIndex.length, chat.chatId);
+        chrome.runtime.sendMessage({
+          type: 'INDEX_STOPPED',
+          accountEmail,
+          currentIndex: i,
+          totalCount: chatsToIndex.length
+        }).catch(() => {});
+        return {
+          indexedCount: successCount,
+          totalCount: chatsToIndex.length,
+          errorCount: errorCount,
+          stopped: true
+        };
+      }
+      
+      const chat = chatsToIndex[i];
+      
+      try {
+        // Сохраняем прогресс перед обработкой каждого чата (только каждые 5 чатов или последний)
+        if (i % 5 === 0 || i === 0) {
+          await saveIndexingState(accountEmail, i, chatsToIndex.length, chat.chatId);
+        }
+        
+        // Отправляем прогресс
+        if (sendProgress) {
+          chrome.runtime.sendMessage({
+            type: 'INDEX_PROGRESS',
+            chatId: chat.chatId,
+            status: 'processing',
+            current: i + 1,
+            total: chatsToIndex.length
+          }).catch(() => {});
+        }
+        
+        // Передаем переиспользуемую вкладку, если она есть
+        const result = await indexChat(accountEmail, chat.chatId, sendProgress, 3, reusableTab); // 3 попытки при ошибках соединения
+        
+        // Если вкладка была создана и может быть переиспользована, сохраняем её
+        if (result && result.reusableTab) {
+          // Проверяем, что вкладка еще существует
+          try {
+            const tabInfo = await chrome.tabs.get(result.reusableTab.id);
+            reusableTab = result.reusableTab;
+            reusableTabCreated = true;
+          } catch (e) {
+            // Вкладка была закрыта, сбрасываем
+            reusableTab = null;
+            reusableTabCreated = false;
+            console.log(`startIndexing: Reusable tab was closed, will create new one for next chat`);
+          }
+        }
+        
+        successCount++;
+        
+        // Сохраняем прогресс после успешной обработки (только каждые 5 чатов или последний)
+        if ((i + 1) % 5 === 0 || i === chatsToIndex.length - 1) {
+          await saveIndexingState(accountEmail, i + 1, chatsToIndex.length, chat.chatId);
+        }
+      
+      if (i < chatsToIndex.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        }
+      } catch (error) {
+        errorCount++;
+        const errorMsg = error.message || String(error);
+        errors.push({ chatId: chat.chatId, error: errorMsg });
+        
+        console.error(`Error indexing chat ${chat.chatId}:`, error);
+        
+        // Проверяем, является ли это ошибкой соединения
+        const isConnectionError = errorMsg.includes('Could not establish connection') ||
+                                  errorMsg.includes('Receiving end does not exist') ||
+                                  errorMsg.includes('Extension context invalidated') ||
+                                  errorMsg.includes('message port closed');
+        
+        if (isConnectionError) {
+          // При ошибке соединения сохраняем состояние и пробрасываем ошибку
+          // чтобы можно было возобновить индексацию
+          await saveIndexingState(accountEmail, i, chatsToIndex.length, chat.chatId);
+          throw new Error(`Индексация прервана из-за потери соединения на чате ${i + 1} из ${chatsToIndex.length}. Используйте "Возобновить индексацию" для продолжения.`);
+        }
+        
+        // Для других ошибок продолжаем со следующим чатом
+        if (sendProgress) {
+          chrome.runtime.sendMessage({
+            type: 'INDEX_PROGRESS',
+            chatId: chat.chatId,
+            status: 'error',
+            error: errorMsg,
+            current: i + 1,
+            total: chatsToIndex.length
+          }).catch(() => {});
+        }
+      }
+    }
+    
+    const index = await getOrCreateIndex(accountEmail);
+    
+    // Serialize index for storage
+    let serializedIndex = null;
+    try {
+      if (index.export) {
+        serializedIndex = index.export();
+      } else {
+        // Fallback: save index metadata
+        serializedIndex = { metadata: { messageCount: chatsToIndex.length } };
+      }
+    } catch (e) {
+      console.error('Error serializing index:', e);
+      serializedIndex = {};
+    }
+    
+    await saveIndex(accountEmail, serializedIndex);
+    
+    await updateAccount(accountEmail, { lastIndexedUTC: toUTCString() });
+    
+    // Закрываем переиспользуемую вкладку после завершения индексации
+    if (reusableTab && reusableTab.id) {
+      try {
+        // Проверяем, что вкладка еще существует перед закрытием
+        await chrome.tabs.get(reusableTab.id);
+        await chrome.tabs.remove(reusableTab.id);
+        console.log(`startIndexing: Closed reusable tab after indexing completion`);
+      } catch (e) {
+        // Вкладка уже была закрыта или не существует
+        console.log(`startIndexing: Reusable tab already closed or doesn't exist:`, e.message);
+      }
+      reusableTab = null;
+      reusableTabCreated = false;
+    }
+    
+    // Очищаем состояние индексации после успешного завершения
+    await clearIndexingState(accountEmail);
+    
+    chrome.runtime.sendMessage({
+      type: 'INDEX_DONE',
+      accountEmail,
+      indexedCount: successCount,
+      totalCount: allChats.length,
+      errorCount: errorCount,
+      errors: errors.length > 0 ? errors : undefined
+    }).catch(() => {});
+    
+    return { 
+      indexedCount: successCount, 
+      totalCount: allChats.length,
+      errorCount: errorCount,
+      errors: errors.length > 0 ? errors : undefined
+    };
+  } catch (error) {
+    console.error('Error during indexing:', error);
+    
+    // Сохраняем состояние при ошибке, чтобы можно было возобновить
+    const errorMsg = error.message || String(error);
+    const isConnectionError = errorMsg.includes('потери соединения') ||
+                              errorMsg.includes('Could not establish connection');
+    
+    if (isConnectionError) {
+      // Состояние уже сохранено в цикле
+      chrome.runtime.sendMessage({
+        type: 'INDEX_PAUSED',
+        accountEmail,
+        error: errorMsg,
+        canResume: true
+      }).catch(() => {});
+    } else {
+    chrome.runtime.sendMessage({
+      type: 'INDEX_ERROR',
+        error: errorMsg
+    }).catch(() => {});
+    }
+    
+    throw error;
+  } finally {
+    // Всегда сбрасываем флаги индексации в конце, даже при ошибке
+    isIndexingActive = false;
+    shouldStopIndexing = false;
+  }
+}
+
+// ========== Export/Import/Reset Functions ==========
+async function exportDatabase() {
+  const db = await initDB();
+  
+  const accounts = await new Promise((resolve, reject) => {
+    const transaction = db.transaction(['accounts'], 'readonly');
+    const store = transaction.objectStore('accounts');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+  
+  const chats = await new Promise((resolve, reject) => {
+    const transaction = db.transaction(['chats'], 'readonly');
+    const store = transaction.objectStore('chats');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+  
+  const messages = await new Promise((resolve, reject) => {
+    const transaction = db.transaction(['messages'], 'readonly');
+    const store = transaction.objectStore('messages');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+  
+  const indexes = await new Promise((resolve, reject) => {
+    const transaction = db.transaction(['indexes'], 'readonly');
+    const store = transaction.objectStore('indexes');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+  
+  return {
+    accounts,
+    chats,
+    messages,
+    indexes,
+    exportDate: toUTCString(),
+    version: '1.0'
+  };
+}
+
+// Helper function to get all data from database
+async function getAllDatabaseData() {
+  const db = await initDB();
+  
+  const accounts = await new Promise((resolve, reject) => {
+    const transaction = db.transaction(['accounts'], 'readonly');
+    const store = transaction.objectStore('accounts');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+  
+  const chats = await new Promise((resolve, reject) => {
+    const transaction = db.transaction(['chats'], 'readonly');
+    const store = transaction.objectStore('chats');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+  
+  const messages = await new Promise((resolve, reject) => {
+    const transaction = db.transaction(['messages'], 'readonly');
+    const store = transaction.objectStore('messages');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+  
+  const indexes = await new Promise((resolve, reject) => {
+    const transaction = db.transaction(['indexes'], 'readonly');
+    const store = transaction.objectStore('indexes');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+  
+  return { accounts, chats, messages, indexes };
+}
+
+// Merge imported data with existing database
+async function mergeDatabase(existingData, importData, mergeStrategy) {
+  const db = await initDB();
+  const stats = {
+    accountsAdded: 0,
+    accountsUpdated: 0,
+    chatsAdded: 0,
+    chatsMerged: 0,
+    chatsKept: 0,
+    messagesAdded: 0,
+    messagesRemoved: 0,
+    indexesMerged: 0
+  };
+  
+  // Create maps for quick lookup
+  const existingChatIds = new Set(existingData.chats.map(c => c.chatId));
+  const existingAccountEmails = new Set(existingData.accounts.map(a => a.email));
+  const existingIndexByAccount = new Map();
+  existingData.indexes.forEach(idx => {
+    if (idx.accountEmail) {
+      existingIndexByAccount.set(idx.accountEmail, idx);
+    }
+  });
+  
+  // Determine conflicting chat IDs
+  const conflictingChatIds = new Set();
+  importData.chats.forEach(chat => {
+    if (existingChatIds.has(chat.chatId)) {
+      conflictingChatIds.add(chat.chatId);
+    }
+  });
+  
+  // Merge accounts (add new, update existing)
+  for (const account of importData.accounts) {
+    const exists = existingAccountEmails.has(account.email);
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(['accounts'], 'readwrite');
+      const store = transaction.objectStore('accounts');
+      const request = store.put(account);
+      request.onsuccess = () => {
+        if (exists) {
+          stats.accountsUpdated++;
+        } else {
+          stats.accountsAdded++;
+        }
+        resolve();
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }
+  
+  // Merge chats based on strategy
+  for (const chat of importData.chats) {
+    const isConflict = conflictingChatIds.has(chat.chatId);
+    
+    if (isConflict) {
+      // Apply merge strategy
+      if (mergeStrategy === 'keep_current') {
+        // Skip this chat, keep existing
+        stats.chatsKept++;
+        continue;
+      } else if (mergeStrategy === 'keep_imported') {
+        // Replace existing chat
+        await new Promise((resolve, reject) => {
+          const transaction = db.transaction(['chats'], 'readwrite');
+          const store = transaction.objectStore('chats');
+          const request = store.put(chat);
+          request.onsuccess = () => {
+            stats.chatsMerged++;
+            resolve();
+          };
+          request.onerror = () => reject(request.error);
+        });
+        
+        // Remove existing messages for this chat
+        const existingMessages = existingData.messages.filter(m => m.chatId === chat.chatId);
+        for (const msg of existingMessages) {
+          await new Promise((resolve, reject) => {
+            const transaction = db.transaction(['messages'], 'readwrite');
+            const store = transaction.objectStore('messages');
+            const request = store.delete(msg.id);
+            request.onsuccess = () => {
+              stats.messagesRemoved++;
+              resolve();
+            };
+            request.onerror = () => reject(request.error);
+          });
+        }
+      }
+    } else {
+      // New chat, add it
+      await new Promise((resolve, reject) => {
+        const transaction = db.transaction(['chats'], 'readwrite');
+        const store = transaction.objectStore('chats');
+        const request = store.put(chat);
+        request.onsuccess = () => {
+          stats.chatsAdded++;
+          resolve();
+        };
+        request.onerror = () => reject(request.error);
+      });
+    }
+  }
+  
+  // Merge messages
+  // If keep_current strategy, skip messages for conflicting chats
+  const chatsToSkipMessages = mergeStrategy === 'keep_current' ? conflictingChatIds : new Set();
+  
+  for (const message of importData.messages) {
+    if (chatsToSkipMessages.has(message.chatId)) {
+      continue; // Skip messages for chats we're keeping current version
+    }
+    
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(['messages'], 'readwrite');
+      const store = transaction.objectStore('messages');
+      const request = store.put(message);
+      request.onsuccess = () => {
+        stats.messagesAdded++;
+        resolve();
+      };
+      request.onerror = () => reject(request.error);
+    });
+  }
+  
+  // Merge indexes by accountEmail
+  for (const importIndex of importData.indexes) {
+    if (!importIndex.accountEmail) continue;
+    
+    const existingIndex = existingIndexByAccount.get(importIndex.accountEmail);
+    
+    if (existingIndex) {
+      // Merge index data - combine documents and termIndex
+      try {
+        // Try to merge index data if it's in export format
+        const existingIndexData = existingIndex.flexIndexJSON || existingIndex;
+        const importIndexData = importIndex.flexIndexJSON || importIndex;
+        
+        // For now, we'll keep the existing index and add new documents from import
+        // This is a simplified merge - full index merge would require rebuilding
+        // Just update the index with import data (replace strategy for indexes)
+        await new Promise((resolve, reject) => {
+          const transaction = db.transaction(['indexes'], 'readwrite');
+          const store = transaction.objectStore('indexes');
+          const request = store.put(importIndex);
+          request.onsuccess = () => {
+            stats.indexesMerged++;
+            resolve();
+          };
+          request.onerror = () => reject(request.error);
+        });
+      } catch (e) {
+        console.error('Error merging index:', e);
+        // Fallback: just replace
+        await new Promise((resolve, reject) => {
+          const transaction = db.transaction(['indexes'], 'readwrite');
+          const store = transaction.objectStore('indexes');
+          const request = store.put(importIndex);
+          request.onsuccess = () => resolve();
+          request.onerror = () => reject(request.error);
+        });
+      }
+    } else {
+      // New index, add it
+      await new Promise((resolve, reject) => {
+        const transaction = db.transaction(['indexes'], 'readwrite');
+        const store = transaction.objectStore('indexes');
+        const request = store.put(importIndex);
+        request.onsuccess = () => {
+          stats.indexesMerged++;
+          resolve();
+        };
+        request.onerror = () => reject(request.error);
+      });
+    }
+  }
+  
+  return stats;
+}
+
+async function importDatabase(data, mergeStrategy = 'replace') {
+  // Проверка наличия данных
+  if (!data) {
+    throw new Error('Данные для импорта отсутствуют. Файл пуст или поврежден.');
+  }
+  
+  // Проверка, что data - это объект
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) {
+    throw new Error('Данные для импорта отсутствуют. Файл пуст или поврежден.');
+  }
+  
+  // Проверка структуры данных
+  const missingFields = [];
+  if (!data.accounts) missingFields.push('accounts');
+  if (!data.chats) missingFields.push('chats');
+  if (!data.messages) missingFields.push('messages');
+  if (!data.indexes) missingFields.push('indexes');
+  
+  if (missingFields.length > 0) {
+    throw new Error(`Неверный формат данных импорта. Отсутствуют обязательные поля: ${missingFields.join(', ')}. Убедитесь, что файл был экспортирован из этого расширения.`);
+  }
+  
+  // Проверка типов данных
+  if (!Array.isArray(data.accounts)) {
+    throw new Error('Неверный формат данных: поле "accounts" должно быть массивом.');
+  }
+  if (!Array.isArray(data.chats)) {
+    throw new Error('Неверный формат данных: поле "chats" должно быть массивом.');
+  }
+  if (!Array.isArray(data.messages)) {
+    throw new Error('Неверный формат данных: поле "messages" должно быть массивом.');
+  }
+  if (!Array.isArray(data.indexes)) {
+    throw new Error('Неверный формат данных: поле "indexes" должно быть массивом.');
+  }
+  
+  // Предупреждение о пустых данных (но не ошибка, так как это может быть валидный экспорт пустой базы)
+  const isEmpty = data.accounts.length === 0 && data.chats.length === 0 && 
+                  data.messages.length === 0 && data.indexes.length === 0;
+  if (isEmpty) {
+    console.warn('Import: Importing empty database. This is valid but will clear existing data.');
+  }
+  
+  const db = await initDB();
+  const hasExistingData = await checkHasData();
+  
+  // If no existing data or explicit replace strategy, do full replace
+  if (!hasExistingData || mergeStrategy === 'replace') {
+    // Clear existing data
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(['accounts', 'chats', 'messages', 'indexes'], 'readwrite');
+      
+      transaction.objectStore('accounts').clear();
+      transaction.objectStore('chats').clear();
+      transaction.objectStore('messages').clear();
+      transaction.objectStore('indexes').clear();
+      
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+    });
+    
+    // Import accounts
+    try {
+      for (let i = 0; i < data.accounts.length; i++) {
+        const account = data.accounts[i];
+        await new Promise((resolve, reject) => {
+          const transaction = db.transaction(['accounts'], 'readwrite');
+          const store = transaction.objectStore('accounts');
+          const request = store.put(account);
+          request.onsuccess = () => resolve();
+          request.onerror = () => reject(new Error(`Ошибка импорта аккаунта ${i + 1}/${data.accounts.length}: ${request.error?.message || 'Неизвестная ошибка'}`));
+        });
+      }
+    } catch (error) {
+      throw new Error(`Ошибка при импорте аккаунтов: ${error.message}`);
+    }
+    
+    // Import chats
+    try {
+      for (let i = 0; i < data.chats.length; i++) {
+        const chat = data.chats[i];
+        await new Promise((resolve, reject) => {
+          const transaction = db.transaction(['chats'], 'readwrite');
+          const store = transaction.objectStore('chats');
+          const request = store.put(chat);
+          request.onsuccess = () => resolve();
+          request.onerror = () => reject(new Error(`Ошибка импорта чата ${i + 1}/${data.chats.length} (ID: ${chat.chatId || 'неизвестен'}): ${request.error?.message || 'Неизвестная ошибка'}`));
+        });
+      }
+    } catch (error) {
+      throw new Error(`Ошибка при импорте чатов: ${error.message}`);
+    }
+    
+    // Import messages
+    try {
+      for (let i = 0; i < data.messages.length; i++) {
+        const message = data.messages[i];
+        await new Promise((resolve, reject) => {
+          const transaction = db.transaction(['messages'], 'readwrite');
+          const store = transaction.objectStore('messages');
+          const request = store.put(message);
+          request.onsuccess = () => resolve();
+          request.onerror = () => reject(new Error(`Ошибка импорта сообщения ${i + 1}/${data.messages.length}: ${request.error?.message || 'Неизвестная ошибка'}`));
+        });
+      }
+    } catch (error) {
+      throw new Error(`Ошибка при импорте сообщений: ${error.message}`);
+    }
+    
+    // Import indexes
+    try {
+      for (let i = 0; i < data.indexes.length; i++) {
+        const indexData = data.indexes[i];
+        await new Promise((resolve, reject) => {
+          const transaction = db.transaction(['indexes'], 'readwrite');
+          const store = transaction.objectStore('indexes');
+          const request = store.put(indexData);
+          request.onsuccess = () => resolve();
+          request.onerror = () => reject(new Error(`Ошибка импорта индекса ${i + 1}/${data.indexes.length}: ${request.error?.message || 'Неизвестная ошибка'}`));
+        });
+      }
+    } catch (error) {
+      throw new Error(`Ошибка при импорте индексов: ${error.message}`);
+    }
+  } else {
+    // Merge mode
+    const existingData = await getAllDatabaseData();
+    await mergeDatabase(existingData, data, mergeStrategy);
+  }
+  
+  // Clear index cache to force reload
+  indexCache.clear();
+}
+
+async function resetAccountData(accountEmail) {
+  const db = await initDB();
+  
+  // Delete chats
+  const chats = await getChatsByAccount(accountEmail);
+  for (const chat of chats) {
+    await deleteMessagesByChat(chat.chatId);
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(['chats'], 'readwrite');
+      const store = transaction.objectStore('chats');
+      const request = store.delete(chat.chatId);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(request.error);
+    });
+  }
+  
+  // Delete index
+  await new Promise((resolve, reject) => {
+    const transaction = db.transaction(['indexes'], 'readwrite');
+    const store = transaction.objectStore('indexes');
+    const request = store.delete(accountEmail);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+  
+  // Delete account
+  await new Promise((resolve, reject) => {
+    const transaction = db.transaction(['accounts'], 'readwrite');
+    const store = transaction.objectStore('accounts');
+    const request = store.delete(accountEmail);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+  
+  // Clear from cache
+  indexCache.delete(accountEmail);
+}
+
+async function checkHasData() {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['chats'], 'readonly');
+    const store = transaction.objectStore('chats');
+    const request = store.count();
+    request.onsuccess = () => resolve(request.result > 0);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// ========== Message Handlers ==========
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === 'START_INDEXING') {
+    const accountEmail = request.accountEmail;
+    const incremental = request.incremental || false;
+    const resume = request.resume || false;
+    const selectedChatIds = request.selectedChatIds || null;
+    
+    startIndexing(accountEmail, incremental, resume, true, selectedChatIds)
+      .then(result => sendResponse({ success: true, ...result }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    
+    return true;
+  }
+  
+  if (request.type === 'RESUME_INDEXING') {
+    const accountEmail = request.accountEmail;
+    
+    startIndexing(accountEmail, false, true) // resume = true
+      .then(result => sendResponse({ success: true, ...result }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    
+    return true;
+  }
+  
+  if (request.type === 'STOP_INDEXING') {
+    shouldStopIndexing = true;
+    sendResponse({ success: true });
+    return true;
+  }
+  
+  if (request.type === 'CHAT_CONTENT') {
+    const { chatId, messages } = request;
+    
+    Promise.all(messages.map(msg => createMessage(msg)))
+      .then(() => sendResponse({ success: true }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    
+    return true;
+  }
+  
+  if (request.type === 'SEARCH') {
+    const { accountEmail, query } = request;
+    
+    getOrCreateIndex(accountEmail)
+      .then(async (index) => {
+        // Search returns documents directly with enrich: true
+        // Увеличиваем лимит, чтобы показать все чаты с совпадениями
+        const results = index.search(query, { limit: 1000, enrich: true });
+        
+        const chatIds = [...new Set(results.map(r => r.chatId))];
+        const chats = await Promise.all(chatIds.map(id => getChat(id)));
+        const chatMap = new Map(chats.map(c => [c.chatId, c]));
+        
+        const searchResults = [];
+        const resultMap = new Map();
+        
+        for (const result of results) {
+          const chat = chatMap.get(result.chatId);
+          if (!chat) continue;
+          
+          if (!resultMap.has(result.chatId)) {
+            resultMap.set(result.chatId, {
+              chatId: result.chatId,
+              title: chat.title,
+              url: chat.url,
+              updatedAtUTC: chat.updatedAtUTC,
+              snippets: [],
+              matchCount: 0 // Счетчик совпадений в чате
+            });
+          }
+          
+          const resultItem = resultMap.get(result.chatId);
+          resultItem.matchCount++; // Увеличиваем счетчик совпадений
+          
+          // Ограничиваем количество сниппетов до 10
+          if (resultItem.snippets.length >= 10) {
+            continue; // Пропускаем, если уже есть 10 сниппетов
+          }
+          
+          // Если это документ с названием чата, добавляем название как сниппет
+          if (result.isChatTitle && result.title) {
+            const highlightedTitle = highlightSearchTerms(result.title, query);
+            const truncated = truncateHtml(highlightedTitle, 150);
+            resultItem.snippets.push(`…${truncated}…`);
+          } else if (result.text) {
+            // Обычное сообщение - обрезаем до 150 символов
+          const highlighted = highlightSearchTerms(result.text, query);
+            const truncated = truncateHtml(highlighted, 150);
+            resultItem.snippets.push(truncated);
+          } else if (result.title && !result.isChatTitle) {
+            // Сообщение с названием в title (для обратной совместимости)
+            const highlighted = highlightSearchTerms(result.title, query);
+            const truncated = truncateHtml(highlighted, 150);
+            resultItem.snippets.push(truncated);
+          }
+        }
+        
+        // Сортируем результаты по дате обновления (свежие сверху, старые внизу)
+        const sortedResults = Array.from(resultMap.values()).sort((a, b) => {
+          const dateA = a.updatedAtUTC ? new Date(a.updatedAtUTC).getTime() : 0;
+          const dateB = b.updatedAtUTC ? new Date(b.updatedAtUTC).getTime() : 0;
+          return dateB - dateA; // Убывание: более свежие даты первыми
+        });
+        
+        sendResponse({
+          success: true,
+          results: sortedResults
+        });
+      })
+      .catch(error => {
+        sendResponse({ success: false, error: error.message });
+      });
+    
+    return true;
+  }
+  
+  if (request.type === 'EXPORT_DB') {
+    exportDatabase()
+      .then(data => sendResponse({ success: true, data }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    
+    return true;
+  }
+  
+  if (request.type === 'IMPORT_DB') {
+    const mergeStrategy = request.mergeStrategy || 'replace';
+    
+    // Проверка наличия данных перед вызовом importDatabase
+    if (!request.data) {
+      sendResponse({ 
+        success: false, 
+        error: 'Данные для импорта отсутствуют. Файл пуст или поврежден.' 
+      });
+      return true;
+    }
+    
+    // Логирование для отладки
+    console.log('Import: Received data type:', typeof request.data);
+    console.log('Import: Has accounts:', !!request.data.accounts);
+    console.log('Import: Has chats:', !!request.data.chats);
+    console.log('Import: Has messages:', !!request.data.messages);
+    console.log('Import: Has indexes:', !!request.data.indexes);
+    
+    importDatabase(request.data, mergeStrategy)
+      .then(() => sendResponse({ success: true }))
+      .catch(error => {
+        console.error('Import error:', error);
+        sendResponse({ success: false, error: error.message });
+      });
+    
+    return true;
+  }
+  
+  if (request.type === 'CHECK_IMPORT_CONFLICTS') {
+    (async () => {
+      try {
+        const hasData = await checkHasData();
+        if (!hasData) {
+          sendResponse({ success: true, hasConflicts: false, conflictCount: 0 });
+          return;
+        }
+        
+        if (!request.data || !request.data.chats) {
+          sendResponse({ success: true, hasConflicts: false, conflictCount: 0 });
+          return;
+        }
+        
+        const existingData = await getAllDatabaseData();
+        const existingChatIds = new Set(existingData.chats.map(c => c.chatId));
+        const importChatIds = new Set(request.data.chats.map(c => c.chatId));
+        
+        let conflictCount = 0;
+        importChatIds.forEach(chatId => {
+          if (existingChatIds.has(chatId)) {
+            conflictCount++;
+          }
+        });
+        
+        sendResponse({ 
+          success: true, 
+          hasConflicts: conflictCount > 0, 
+          conflictCount 
+        });
+      } catch (error) {
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    
+    return true;
+  }
+  
+  if (request.type === 'RESET_DB') {
+    resetAccountData(request.accountEmail)
+      .then(() => sendResponse({ success: true }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    
+    return true;
+  }
+  
+  if (request.type === 'CHECK_DATA') {
+    checkHasData()
+      .then(hasData => sendResponse({ success: true, hasData }))
+      .catch(error => sendResponse({ success: false, hasData: false, error: error.message }));
+    
+    return true;
+  }
+  
+  if (request.type === 'GET_ACCOUNTS') {
+    (async () => {
+      try {
+        const db = await initDB();
+        const accounts = await new Promise((resolve, reject) => {
+          const transaction = db.transaction(['accounts'], 'readonly');
+          const store = transaction.objectStore('accounts');
+          const request = store.getAll();
+          request.onsuccess = () => resolve(request.result || []);
+          request.onerror = () => reject(request.error);
+        });
+        
+        // Для каждого аккаунта получаем количество чатов
+        const accountsWithChats = await Promise.all(accounts.map(async (account) => {
+          const chats = await getChatsByAccount(account.email);
+          return {
+            email: account.email,
+            chatCount: chats.length,
+            lastIndexedUTC: account.lastIndexedUTC
+          };
+        }));
+        
+        sendResponse({ success: true, accounts: accountsWithChats });
+      } catch (error) {
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    return true;
+  }
+  
+  if (request.type === 'GET_DIAGNOSTICS') {
+    getDatabaseDiagnostics(request.accountEmail)
+      .then(diagnostics => sendResponse({ success: true, diagnostics }))
+      .catch(error => sendResponse({ success: false, error: error.message }));
+    
+    return true;
+  }
+  
+  if (request.type === 'GET_CHATS_FOR_SELECTION') {
+    (async () => {
+      try {
+        const { accountEmail } = request;
+        const chats = await getChatsByAccount(accountEmail);
+        
+        // Фильтруем только чаты с названием (не "Без названия")
+        const chatsWithTitle = chats.filter(chat => 
+          chat.title && chat.title.trim() && chat.title.trim() !== 'Без названия'
+        );
+        
+        // Форматируем для отправки
+        const formattedChats = chatsWithTitle.map(chat => ({
+          chatId: chat.chatId,
+          title: chat.title,
+          updatedAtUTC: chat.updatedAtUTC,
+          lastIndexedUTC: chat.lastIndexedUTC,
+          isIndexed: !!chat.lastIndexedUTC
+        }));
+        
+        sendResponse({ success: true, chats: formattedChats });
+      } catch (error) {
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    return true;
+  }
+  
+  return false;
+});
 

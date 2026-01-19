@@ -3,28 +3,140 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Requests</title>
+    <title>Copilot Indexer</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
     <header class="toolbar">
-      <div class="toolbar__title">Copilot API Requests</div>
-      <button id="getAccountBtn" class="toolbar__btn" type="button" title="Получить email аккаунта Copilot">Get Account</button>
-      <button id="clearBtn" class="toolbar__btn" type="button">Clear</button>
+      <div class="toolbar__title">Copilot Chat Indexer</div>
     </header>
     <div id="status" class="status hidden"></div>
 
-    <section class="requests">
-      <div id="emptyState" class="empty">No requests yet.</div>
-      <ul id="requestList" class="request-list"></ul>
-    </section>
+    <!-- Tabs -->
+    <div class="tabs">
+      <button id="tabIndex" class="tab-button active" data-tab="index">Индекс</button>
+      <button id="tabSearch" class="tab-button" data-tab="search">Поиск</button>
+      <button id="tabRequests" class="tab-button" data-tab="requests">Запросы</button>
+    </div>
 
-    <section class="details">
-      <div class="details__title">Request details</div>
-      <div id="detailsBody" class="details__body empty">
-        Select a request to see all fields.
+    <!-- Index Tab -->
+    <div id="tabContentIndex" class="tab-content active">
+      <div class="index-section">
+        <button id="diagnosticsBtn" class="action-button">Проверить состояние</button>
+        
+        <!-- Collapsible Indexing Section -->
+        <div class="indexing-section">
+          <div class="indexing-header">
+            <button id="indexToggleBtn" class="index-toggle-button">
+              <span class="toggle-icon">▼</span>
+              <span>Индексация</span>
+              <span id="indexingStats" class="indexing-stats"></span>
+            </button>
+            <div id="indexingInfo" class="indexing-info hidden"></div>
+            <button id="indexControlBtn" class="index-control-button">Начать индексацию</button>
+          </div>
+          <div id="indexingContent" class="indexing-content collapsed">
+            <!-- Chat Selection -->
+            <div id="chatSelectionContainer" class="chat-selection-container">
+              <div class="chat-selection-header">
+                <label class="select-all-checkbox">
+                  <input type="checkbox" id="selectAllChats" />
+                  <span>Выбрать все</span>
+                </label>
+                <div class="sort-controls">
+                  <select id="sortBy" class="sort-select">
+                    <option value="date-desc">По дате (позднее)</option>
+                    <option value="date-asc">По дате (раньше)</option>
+                    <option value="checked">Чекнутые</option>
+                    <option value="unchecked">Анчекнутые</option>
+                    <option value="alphabet">По алфавиту</option>
+                  </select>
+                </div>
+              </div>
+              <div id="chatsList" class="chats-list">
+                <div class="loading-chats">Загрузка чатов...</div>
+              </div>
+            </div>
+            
+            <button id="resumeIndexBtn" class="action-button" style="display: none;">Возобновить индексацию</button>
+          </div>
+        </div>
+        
+        <button id="exportBtn" class="action-button">Сохранить базу</button>
+        <button id="importBtn" class="action-button">Загрузить базу</button>
+        <input type="file" id="importFile" accept=".json" style="display: none;" />
+        <button id="resetBtn" class="action-button danger">Сбросить базу</button>
+        <div id="indexProgress" class="progress hidden"></div>
+        <div id="diagnosticsInfo" class="diagnostics-info hidden"></div>
       </div>
-    </section>
+    </div>
+
+    <!-- Search Tab -->
+    <div id="tabContentSearch" class="tab-content">
+      <div class="search-section">
+        <input type="text" id="searchInput" class="search-input" placeholder="Введите минимум 2 символа для поиска..." />
+        <div id="searchResults" class="search-results"></div>
+        <div id="searchEmpty" class="empty">Введите запрос для поиска</div>
+      </div>
+    </div>
+
+    <!-- Requests Tab -->
+    <div id="tabContentRequests" class="tab-content">
+      <div class="requests-section">
+        <div class="requests-header">
+          <button id="refreshRequestsBtn" class="action-button">Обновить</button>
+          <button id="clearRequestsBtn" class="action-button">Очистить</button>
+          <span id="requestsCount" class="requests-count"></span>
+        </div>
+        <div id="requestsList" class="requests-list"></div>
+        <div id="requestsEmpty" class="empty">Нет запросов. Откройте страницу Copilot и обновите список.</div>
+        <div id="responseViewer" class="response-viewer hidden">
+          <div class="response-viewer-header">
+            <span id="responseViewerTitle" class="response-viewer-title"></span>
+            <button id="closeResponseViewer" class="close-button">×</button>
+          </div>
+          <div id="responseViewerContent" class="response-viewer-content"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Merge Dialog Modal -->
+    <div id="mergeDialog" class="modal-overlay hidden">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 class="modal-title">Объединение баз данных</h3>
+        </div>
+        <div class="modal-body">
+          <p class="modal-warning">
+            В базе данных уже есть данные. Загружаемая база будет объединена с существующей.
+          </p>
+          <p id="conflictInfo" class="modal-conflict-info"></p>
+          <p class="modal-question">
+            При обнаружении пересечений (чаты с одинаковыми ID):
+          </p>
+          <div class="modal-options">
+            <label class="modal-option">
+              <input type="radio" name="mergeStrategy" value="keep_current" checked />
+              <span class="modal-option-label">
+                <strong>Оставить текущие версии</strong>
+                <span class="modal-option-desc">Текущие данные останутся без изменений</span>
+              </span>
+            </label>
+            <label class="modal-option">
+              <input type="radio" name="mergeStrategy" value="keep_imported" />
+              <span class="modal-option-label">
+                <strong>Использовать загружаемые версии</strong>
+                <span class="modal-option-desc">Загружаемые данные заменят текущие</span>
+              </span>
+            </label>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button id="mergeDialogCancel" class="action-button">Отмена</button>
+          <button id="mergeDialogConfirm" class="action-button">Продолжить</button>
+        </div>
+      </div>
+    </div>
 
     <script src="popup.js"></script>
   </body>
