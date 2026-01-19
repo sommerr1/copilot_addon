@@ -5,6 +5,8 @@ let searchTimeout = null;
 let chatsData = [];
 let selectedChatIds = new Set();
 let chatCheckboxes = new Map();
+let collapsedChats = new Set(); // Для отслеживания свернутых чатов
+let allChatsCollapsed = false; // Состояние "свернуть все"
 
 // UI Elements
 const tabIndex = document.getElementById('tabIndex');
@@ -402,6 +404,17 @@ function setupChatSelection() {
           selectedChatIds.delete(chatId);
         }
       });
+      
+      // Update month checkboxes if date sorting is active
+      const sortValue = sortBy.value;
+      if (sortValue === 'date-desc' || sortValue === 'date-asc') {
+        const monthCheckboxes = chatsList.querySelectorAll('.month-checkbox');
+        monthCheckboxes.forEach(monthCheckbox => {
+          monthCheckbox.checked = checked;
+          monthCheckbox.indeterminate = false;
+        });
+      }
+      
       updateSelectAllState();
     });
   }
@@ -459,6 +472,32 @@ function initializeChatSelection() {
   });
 }
 
+// Helper function to get month key from date
+function getMonthKey(dateString) {
+  if (!dateString) return null;
+  try {
+    const date = new Date(dateString);
+    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Helper function to format month name
+function formatMonthName(dateString) {
+  if (!dateString) return 'Без даты';
+  try {
+    const date = new Date(dateString);
+    const months = [
+      'Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+      'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'
+    ];
+    return `${months[date.getMonth()]} ${date.getFullYear()}`;
+  } catch (e) {
+    return 'Без даты';
+  }
+}
+
 // Render chats list
 function renderChatsList() {
   if (!chatsList || chatsData.length === 0) {
@@ -493,49 +532,307 @@ function renderChatsList() {
     }
   });
   
+  // Check if sorting by date
+  const isDateSorting = sortValue === 'date-desc' || sortValue === 'date-asc';
+  
   // Render
   chatsList.innerHTML = '';
-  sortedChats.forEach(chat => {
-    const item = document.createElement('div');
-    item.className = `chat-item ${chat.isIndexed ? 'indexed' : ''}`;
-    
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.className = 'chat-checkbox';
-    checkbox.id = `chat-${chat.chatId}`;
-    checkbox.checked = selectedChatIds.has(chat.chatId);
-    checkbox.addEventListener('change', (e) => {
-      if (e.target.checked) {
-        selectedChatIds.add(chat.chatId);
-      } else {
-        selectedChatIds.delete(chat.chatId);
+  
+  if (isDateSorting) {
+    // Group chats by month
+    const chatsByMonth = new Map();
+    sortedChats.forEach(chat => {
+      const monthKey = getMonthKey(chat.updatedAtUTC) || 'no-date';
+      if (!chatsByMonth.has(monthKey)) {
+        chatsByMonth.set(monthKey, []);
       }
-      updateSelectAllState();
+      chatsByMonth.get(monthKey).push(chat);
     });
     
-    chatCheckboxes.set(chat.chatId, checkbox);
+    // Sort month keys (descending for date-desc, ascending for date-asc)
+    const sortedMonthKeys = Array.from(chatsByMonth.keys()).sort((a, b) => {
+      if (a === 'no-date') return 1;
+      if (b === 'no-date') return -1;
+      return sortValue === 'date-desc' ? b.localeCompare(a) : a.localeCompare(b);
+    });
     
-    const info = document.createElement('div');
-    info.className = 'chat-info';
-    
-    const title = document.createElement('div');
-    title.className = 'chat-title';
-    title.textContent = chat.title || 'Без названия';
-    
-    const date = document.createElement('div');
-    date.className = 'chat-date';
-    date.textContent = chat.updatedAtUTC ? formatDate(chat.updatedAtUTC) : 'Дата неизвестна';
-    
-    info.appendChild(title);
-    info.appendChild(date);
-    
-    item.appendChild(checkbox);
-    item.appendChild(info);
-    chatsList.appendChild(item);
-  });
+    // Render with month separators
+    sortedMonthKeys.forEach((monthKey, monthIndex) => {
+      const monthChats = chatsByMonth.get(monthKey);
+      const monthName = monthKey === 'no-date' 
+        ? 'Без даты' 
+        : formatMonthName(monthChats[0].updatedAtUTC);
+      
+      // Month separator with checkbox
+      const monthSeparator = document.createElement('div');
+      monthSeparator.className = 'month-separator';
+      monthSeparator.dataset.monthKey = monthKey;
+      monthSeparator.id = `month-separator-${monthKey}`;
+      
+      const monthCheckbox = document.createElement('input');
+      monthCheckbox.type = 'checkbox';
+      monthCheckbox.className = 'month-checkbox';
+      monthCheckbox.id = `month-${monthKey}`;
+      
+      // Check if all chats in this month are selected
+      const allSelected = monthChats.every(chat => selectedChatIds.has(chat.chatId));
+      const someSelected = monthChats.some(chat => selectedChatIds.has(chat.chatId));
+      monthCheckbox.checked = allSelected;
+      monthCheckbox.indeterminate = someSelected && !allSelected;
+      
+      // Store month chats for checkbox handler
+      monthCheckbox.dataset.monthKey = monthKey;
+      
+      monthCheckbox.addEventListener('change', (e) => {
+        const checked = e.target.checked;
+        monthChats.forEach(chat => {
+          if (checked) {
+            selectedChatIds.add(chat.chatId);
+          } else {
+            selectedChatIds.delete(chat.chatId);
+          }
+          // Update individual chat checkbox if it exists
+          const chatCheckbox = chatCheckboxes.get(chat.chatId);
+          if (chatCheckbox) {
+            chatCheckbox.checked = checked;
+          }
+        });
+        updateSelectAllState();
+        updateIndexingStats();
+      });
+      
+      const monthLabel = document.createElement('label');
+      monthLabel.className = 'month-label';
+      monthLabel.htmlFor = `month-${monthKey}`;
+      monthLabel.textContent = monthName;
+      
+      const monthCount = document.createElement('span');
+      monthCount.className = 'month-count';
+      monthCount.textContent = `(${monthChats.length})`;
+      
+      // Navigation arrows container
+      const navArrows = document.createElement('div');
+      navArrows.className = 'month-nav-arrows';
+      
+      // Up arrow (previous month)
+      const upArrow = document.createElement('button');
+      upArrow.className = 'month-nav-arrow month-nav-arrow-up';
+      upArrow.type = 'button';
+      upArrow.innerHTML = '▲';
+      upArrow.title = 'Предыдущий месяц';
+      upArrow.setAttribute('aria-label', 'Предыдущий месяц');
+      
+      // Down arrow (next month)
+      const downArrow = document.createElement('button');
+      downArrow.className = 'month-nav-arrow month-nav-arrow-down';
+      downArrow.type = 'button';
+      downArrow.innerHTML = '▼';
+      downArrow.title = 'Следующий месяц';
+      downArrow.setAttribute('aria-label', 'Следующий месяц');
+      
+      // Determine if arrows should be disabled
+      const isFirstMonth = monthIndex === 0;
+      const isLastMonth = monthIndex === sortedMonthKeys.length - 1;
+      
+      if (isFirstMonth) {
+        upArrow.disabled = true;
+        upArrow.classList.add('disabled');
+      }
+      
+      if (isLastMonth) {
+        downArrow.disabled = true;
+        downArrow.classList.add('disabled');
+      }
+      
+      // Navigation handlers
+      upArrow.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        if (!isFirstMonth && monthIndex > 0) {
+          const prevMonthKey = sortedMonthKeys[monthIndex - 1];
+          scrollToMonth(prevMonthKey);
+        }
+      });
+      
+      downArrow.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        if (!isLastMonth && monthIndex < sortedMonthKeys.length - 1) {
+          const nextMonthKey = sortedMonthKeys[monthIndex + 1];
+          scrollToMonth(nextMonthKey);
+        }
+      });
+      
+      navArrows.appendChild(upArrow);
+      navArrows.appendChild(downArrow);
+      
+      monthSeparator.appendChild(monthCheckbox);
+      monthSeparator.appendChild(monthLabel);
+      monthSeparator.appendChild(monthCount);
+      monthSeparator.appendChild(navArrows);
+      chatsList.appendChild(monthSeparator);
+      
+      // Render chats for this month
+      monthChats.forEach(chat => {
+        const item = document.createElement('div');
+        item.className = `chat-item ${chat.isIndexed ? 'indexed' : ''}`;
+        
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'chat-checkbox';
+        checkbox.id = `chat-${chat.chatId}`;
+        checkbox.checked = selectedChatIds.has(chat.chatId);
+        checkbox.dataset.monthKey = monthKey;
+        checkbox.addEventListener('change', (e) => {
+          if (e.target.checked) {
+            selectedChatIds.add(chat.chatId);
+          } else {
+            selectedChatIds.delete(chat.chatId);
+          }
+          // Update month checkbox state
+          updateMonthCheckboxState(monthKey);
+          updateSelectAllState();
+          updateIndexingStats();
+        });
+        
+        chatCheckboxes.set(chat.chatId, checkbox);
+        
+        const info = document.createElement('div');
+        info.className = 'chat-info';
+        
+        const title = document.createElement('div');
+        title.className = 'chat-title';
+        title.textContent = chat.title || 'Без названия';
+        
+        const date = document.createElement('div');
+        date.className = 'chat-date';
+        date.textContent = chat.updatedAtUTC ? formatDate(chat.updatedAtUTC) : 'Дата неизвестна';
+        
+        info.appendChild(title);
+        info.appendChild(date);
+        
+        item.appendChild(checkbox);
+        item.appendChild(info);
+        chatsList.appendChild(item);
+      });
+    });
+  } else {
+    // Render without month separators
+    sortedChats.forEach(chat => {
+      const item = document.createElement('div');
+      item.className = `chat-item ${chat.isIndexed ? 'indexed' : ''}`;
+      
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'chat-checkbox';
+      checkbox.id = `chat-${chat.chatId}`;
+      checkbox.checked = selectedChatIds.has(chat.chatId);
+      checkbox.addEventListener('change', (e) => {
+        if (e.target.checked) {
+          selectedChatIds.add(chat.chatId);
+        } else {
+          selectedChatIds.delete(chat.chatId);
+        }
+        updateSelectAllState();
+      });
+      
+      chatCheckboxes.set(chat.chatId, checkbox);
+      
+      const info = document.createElement('div');
+      info.className = 'chat-info';
+      
+      const title = document.createElement('div');
+      title.className = 'chat-title';
+      title.textContent = chat.title || 'Без названия';
+      
+      const date = document.createElement('div');
+      date.className = 'chat-date';
+      date.textContent = chat.updatedAtUTC ? formatDate(chat.updatedAtUTC) : 'Дата неизвестна';
+      
+      info.appendChild(title);
+      info.appendChild(date);
+      
+      item.appendChild(checkbox);
+      item.appendChild(info);
+      chatsList.appendChild(item);
+    });
+  }
   
   updateSelectAllState();
   updateIndexingStats();
+}
+
+// Update month checkbox state based on individual chat checkboxes
+function updateMonthCheckboxState(monthKey) {
+  const monthCheckbox = document.getElementById(`month-${monthKey}`);
+  if (!monthCheckbox) return;
+  
+  // Find all chats with this monthKey
+  const monthChats = chatsData.filter(chat => {
+    const chatMonthKey = getMonthKey(chat.updatedAtUTC) || 'no-date';
+    return chatMonthKey === monthKey;
+  });
+  
+  if (monthChats.length === 0) return;
+  
+  const allSelected = monthChats.every(chat => selectedChatIds.has(chat.chatId));
+  const someSelected = monthChats.some(chat => selectedChatIds.has(chat.chatId));
+  
+  monthCheckbox.checked = allSelected;
+  monthCheckbox.indeterminate = someSelected && !allSelected;
+}
+
+// Scroll to specific month separator with smooth scrolling
+function scrollToMonth(monthKey) {
+  const monthSeparator = document.getElementById(`month-separator-${monthKey}`);
+  if (!monthSeparator || !chatsList) {
+    console.warn('scrollToMonth: separator or container not found', monthKey);
+    return;
+  }
+  
+  // Find all children of chatsList to calculate position
+  const children = Array.from(chatsList.children);
+  const separatorIndex = children.indexOf(monthSeparator);
+  
+  if (separatorIndex === -1) {
+    console.warn('scrollToMonth: separator not found in container children');
+    // Fallback to scrollIntoView
+    monthSeparator.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+      inline: 'nearest'
+    });
+    monthSeparator.classList.add('month-highlight');
+    setTimeout(() => {
+      monthSeparator.classList.remove('month-highlight');
+    }, 1000);
+    return;
+  }
+  
+  // Calculate total height of all elements before the separator
+  let totalHeight = 0;
+  for (let i = 0; i < separatorIndex; i++) {
+    const child = children[i];
+    const style = window.getComputedStyle(child);
+    const marginTop = parseFloat(style.marginTop) || 0;
+    const marginBottom = parseFloat(style.marginBottom) || 0;
+    totalHeight += child.offsetHeight + marginTop + marginBottom;
+  }
+  
+  // Scroll to calculated position with small offset
+  const offset = 4;
+  const targetScrollTop = Math.max(0, totalHeight - offset);
+  
+  chatsList.scrollTo({
+    top: targetScrollTop,
+    behavior: 'smooth'
+  });
+  
+  // Add highlight effect
+  monthSeparator.classList.add('month-highlight');
+  setTimeout(() => {
+    monthSeparator.classList.remove('month-highlight');
+  }, 1000);
 }
 
 // Update select all checkbox state
@@ -940,6 +1237,19 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 });
 
+// Helper function to sanitize account email for filename
+function sanitizeAccountForFilename(accountEmail) {
+  if (!accountEmail) {
+    return 'unknown';
+  }
+  // Replace forbidden characters: / \ : * ? " < > |
+  // Also replace @ with underscore and remove spaces
+  return accountEmail
+    .replace(/[/\\:*?"<>|@\s]/g, '_')
+    .replace(/_+/g, '_') // Replace multiple underscores with single
+    .replace(/^_|_$/g, ''); // Remove leading/trailing underscores
+}
+
 // Export
 if (exportBtn) {
   exportBtn.addEventListener('click', async () => {
@@ -952,7 +1262,12 @@ if (exportBtn) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `copilot_index_${new Date().toISOString().split('T')[0]}.json`;
+        
+        // Generate filename: copilot_ind_ + sanitized account + date (YYYY-MM-DD)
+        const sanitizedAccount = sanitizeAccountForFilename(currentAccountEmail);
+        const dateStr = new Date().toISOString().split('T')[0];
+        a.download = `copilot_ind_${sanitizedAccount}_${dateStr}.json`;
+        
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -1394,32 +1709,128 @@ function displaySearchResults(results) {
   
   searchEmpty.style.display = 'none';
   searchResults.innerHTML = '';
+  collapsedChats.clear();
+  allChatsCollapsed = false;
   
-  // Показываем количество найденных чатов
+  // Удаляем старые обработчики скролла, если они есть
+  const oldScrollHandler = searchResults._scrollHandler;
+  if (oldScrollHandler) {
+    searchResults.removeEventListener('scroll', oldScrollHandler);
+  }
+  
+  // Заголовок с кнопкой "Свернуть все/Развернуть все"
+  const resultsHeader = document.createElement('div');
+  resultsHeader.className = 'search-results-header';
+  resultsHeader.style.display = 'flex';
+  resultsHeader.style.justifyContent = 'space-between';
+  resultsHeader.style.alignItems = 'center';
+  resultsHeader.style.marginBottom = '8px';
+  resultsHeader.style.padding = '4px 0';
+  resultsHeader.style.transition = 'transform 0.3s ease-in-out, opacity 0.3s ease-in-out';
+  resultsHeader.style.opacity = '1';
+  
   const resultsCount = document.createElement('div');
+  resultsCount.className = 'search-results-count';
   resultsCount.style.fontSize = '12px';
   resultsCount.style.color = '#666';
-  resultsCount.style.marginBottom = '8px';
-  resultsCount.style.padding = '4px 0';
   resultsCount.textContent = `Найдено чатов: ${results.length}`;
-  searchResults.appendChild(resultsCount);
   
-  for (const result of results) {
+  const toggleAllBtn = document.createElement('button');
+  toggleAllBtn.className = 'search-toggle-all-btn';
+  toggleAllBtn.style.padding = '4px 8px';
+  toggleAllBtn.style.border = '1px solid #c7c7c7';
+  toggleAllBtn.style.background = '#fff';
+  toggleAllBtn.style.borderRadius = '4px';
+  toggleAllBtn.style.cursor = 'pointer';
+  toggleAllBtn.style.fontSize = '11px';
+  toggleAllBtn.style.color = '#666';
+  toggleAllBtn.textContent = 'Свернуть все';
+  toggleAllBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleAllChats(results);
+  });
+  
+  resultsHeader.appendChild(resultsCount);
+  resultsHeader.appendChild(toggleAllBtn);
+  searchResults.appendChild(resultsHeader);
+  
+  // Функция для переключения состояния всех чатов
+  function toggleAllChats(results) {
+    allChatsCollapsed = !allChatsCollapsed;
+    toggleAllBtn.textContent = allChatsCollapsed ? 'Развернуть все' : 'Свернуть все';
+    
+    const items = searchResults.querySelectorAll('.search-result-item');
+    items.forEach((item, index) => {
+      const chatId = results[index]?.chatId || index;
+      const collapseBtn = item.querySelector('.search-collapse-btn');
+      
+      if (allChatsCollapsed) {
+        collapsedChats.add(chatId);
+        item.classList.add('collapsed');
+        if (collapseBtn) {
+          collapseBtn.textContent = '▶';
+        }
+      } else {
+        collapsedChats.delete(chatId);
+        item.classList.remove('collapsed');
+        if (collapseBtn) {
+          collapseBtn.textContent = '▼';
+        }
+      }
+    });
+  }
+  
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    const chatId = result.chatId || i;
     const item = document.createElement('div');
     item.className = 'search-result-item';
+    item.dataset.chatId = chatId;
     
+    // Заголовок чата с кнопкой сворачивания
     const titleRow = document.createElement('div');
+    titleRow.className = 'search-result-title-row';
     titleRow.style.display = 'flex';
     titleRow.style.justifyContent = 'space-between';
     titleRow.style.alignItems = 'center';
     titleRow.style.marginBottom = '8px';
+    titleRow.style.cursor = 'pointer';
+    
+    const titleLeft = document.createElement('div');
+    titleLeft.style.display = 'flex';
+    titleLeft.style.alignItems = 'center';
+    titleLeft.style.flex = '1';
+    titleLeft.style.minWidth = '0';
+    titleLeft.style.gap = '8px';
+    
+    const collapseBtn = document.createElement('button');
+    collapseBtn.className = 'search-collapse-btn';
+    collapseBtn.style.padding = '2px 4px';
+    collapseBtn.style.border = 'none';
+    collapseBtn.style.background = 'transparent';
+    collapseBtn.style.cursor = 'pointer';
+    collapseBtn.style.fontSize = '12px';
+    collapseBtn.style.color = '#666';
+    collapseBtn.style.width = '20px';
+    collapseBtn.style.height = '20px';
+    collapseBtn.style.display = 'flex';
+    collapseBtn.style.alignItems = 'center';
+    collapseBtn.style.justifyContent = 'center';
+    collapseBtn.textContent = '▼';
+    collapseBtn.style.transition = 'transform 0.2s';
     
     const title = document.createElement('div');
     title.className = 'search-result-title';
     title.style.marginBottom = '0';
+    title.style.flex = '1';
+    title.style.minWidth = '0';
     title.textContent = result.title || 'Без названия';
+    title.style.textDecoration = 'underline';
+    title.style.color = '#1a66d4';
+    title.style.cursor = 'pointer';
     title.addEventListener('click', (e) => {
       e.preventDefault();
+      e.stopPropagation();
       chrome.tabs.create({ url: result.url });
     });
     
@@ -1428,12 +1839,48 @@ function displaySearchResults(results) {
     dateInfo.style.fontSize = '11px';
     dateInfo.style.color = '#666';
     dateInfo.style.marginLeft = '8px';
+    dateInfo.style.flexShrink = '0';
     dateInfo.textContent = result.updatedAtUTC ? formatDate(result.updatedAtUTC) : '';
     
-    titleRow.appendChild(title);
+    titleLeft.appendChild(collapseBtn);
+    titleLeft.appendChild(title);
+    titleRow.appendChild(titleLeft);
     if (dateInfo.textContent) {
       titleRow.appendChild(dateInfo);
     }
+    
+    // Обработчик сворачивания/разворачивания отдельного чата
+    const toggleChat = () => {
+      const isCollapsed = collapsedChats.has(chatId);
+      if (isCollapsed) {
+        collapsedChats.delete(chatId);
+        item.classList.remove('collapsed');
+        collapseBtn.textContent = '▼';
+        collapseBtn.style.transform = 'rotate(0deg)';
+      } else {
+        collapsedChats.add(chatId);
+        item.classList.add('collapsed');
+        collapseBtn.textContent = '▶';
+        collapseBtn.style.transform = 'rotate(0deg)';
+      }
+      // Обновляем состояние кнопки "Свернуть все"
+      updateToggleAllButton();
+    };
+    
+    collapseBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleChat();
+    });
+    
+    titleRow.addEventListener('click', (e) => {
+      if (e.target !== title && e.target !== collapseBtn) {
+        toggleChat();
+      }
+    });
+    
+    // Контент чата (matchInfo + snippets)
+    const chatContent = document.createElement('div');
+    chatContent.className = 'search-result-content';
     
     // Информация о количестве совпадений в чате
     const matchInfo = document.createElement('div');
@@ -1476,11 +1923,68 @@ function displaySearchResults(results) {
       snippets.appendChild(noSnippets);
     }
     
+    chatContent.appendChild(matchInfo);
+    chatContent.appendChild(snippets);
+    
     item.appendChild(titleRow);
-    item.appendChild(matchInfo);
-    item.appendChild(snippets);
+    item.appendChild(chatContent);
     searchResults.appendChild(item);
   }
+  
+  // Функция для обновления состояния кнопки "Свернуть все"
+  function updateToggleAllButton() {
+    const items = searchResults.querySelectorAll('.search-result-item');
+    const allCollapsed = items.length > 0 && Array.from(items).every(item => item.classList.contains('collapsed'));
+    const allExpanded = items.length > 0 && Array.from(items).every(item => !item.classList.contains('collapsed'));
+    
+    if (allCollapsed) {
+      toggleAllBtn.textContent = 'Развернуть все';
+      allChatsCollapsed = true;
+    } else if (allExpanded) {
+      toggleAllBtn.textContent = 'Свернуть все';
+      allChatsCollapsed = false;
+    } else {
+      toggleAllBtn.textContent = 'Свернуть все';
+      allChatsCollapsed = false;
+    }
+  }
+  
+  // Обработчик скролла для скрытия/показа заголовка
+  let lastScrollTop = 0;
+  let scrollTimeout = null;
+  
+  const scrollHandler = () => {
+    const currentScrollTop = searchResults.scrollTop;
+    
+    if (scrollTimeout) {
+      clearTimeout(scrollTimeout);
+    }
+    
+    // Плавное скрытие/показ при скролле
+    if (currentScrollTop > lastScrollTop && currentScrollTop > 10) {
+      // Скролл вниз - скрываем заголовок
+      resultsHeader.style.transform = 'translateY(-100%)';
+      resultsHeader.style.opacity = '0';
+    } else if (currentScrollTop < lastScrollTop) {
+      // Скролл вверх - показываем заголовок
+      resultsHeader.style.transform = 'translateY(0)';
+      resultsHeader.style.opacity = '1';
+    }
+    
+    lastScrollTop = currentScrollTop;
+    
+    // Небольшая задержка перед скрытием при остановке скролла
+    scrollTimeout = setTimeout(() => {
+      if (currentScrollTop === 0) {
+        resultsHeader.style.transform = 'translateY(0)';
+        resultsHeader.style.opacity = '1';
+      }
+    }, 150);
+  };
+  
+  // Сохраняем ссылку на обработчик для возможности удаления
+  searchResults._scrollHandler = scrollHandler;
+  searchResults.addEventListener('scroll', scrollHandler);
 }
 
 if (searchInput) {
