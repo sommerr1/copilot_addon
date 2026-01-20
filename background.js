@@ -594,6 +594,17 @@ async function getAccount(email) {
   });
 }
 
+async function getAllAccounts() {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(['accounts'], 'readonly');
+    const store = transaction.objectStore('accounts');
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result || []);
+    request.onerror = () => reject(request.error);
+  });
+}
+
 async function createAccount(email, data = {}) {
   const db = await initDB();
   const account = {
@@ -3017,7 +3028,221 @@ async function startIndexing(accountEmail, incremental = false, resume = false, 
 }
 
 // ========== Export/Import/Reset Functions ==========
-async function exportDatabase() {
+// Helper function to sanitize account email for filename
+function sanitizeAccountForFilename(accountEmail) {
+  if (!accountEmail) {
+    return 'unknown';
+  }
+  return accountEmail
+    .replace(/[/\\:*?"<>|@\s]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '');
+}
+
+// Helper function to get month key from date string
+function getMonthKey(dateString) {
+  if (!dateString) {
+    return null;
+  }
+  
+  try {
+    const date = new Date(dateString);
+    
+    // Check if date is valid
+    if (isNaN(date.getTime())) {
+      return null;
+    }
+    
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const monthKey = `${year}_${month}`;
+    
+    return monthKey;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Helper function to get date string for filename (YYYY-MM-DD)
+function getDateStringForFilename(date = new Date()) {
+  const d = new Date(date);
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+// Split data by months
+function splitDataByMonths(accounts, chats, messages, indexes, accountEmail) {
+  const sanitizedAccount = sanitizeAccountForFilename(accountEmail || 'unknown');
+  const files = [];
+  
+  console.log(`splitDataByMonths: Starting with ${messages.length} messages, ${chats.length} chats`);
+  
+  // Group chats by month based on their updatedAtUTC (date of last modification)
+  // This is the actual date when the chat was last updated, not the indexing date
+  const chatsByMonth = new Map();
+  const chatIdsByMonth = new Map();
+  let skippedChats = 0;
+  const monthKeySamples = new Map(); // Store sample timestamps for debugging
+  
+  // Debug: Check chat update dates distribution
+  const sampleDates = chats.slice(0, Math.min(10, chats.length)).map(c => c.updatedAtUTC);
+  console.log(`splitDataByMonths: Sample chat update dates (first 10):`, sampleDates);
+  
+  // Check date range of all chats
+  const allDates = chats
+    .map(c => c.updatedAtUTC ? new Date(c.updatedAtUTC) : null)
+    .filter(d => d && !isNaN(d.getTime()))
+    .sort((a, b) => a - b);
+  
+  if (allDates.length > 0) {
+    const minDate = allDates[0];
+    const maxDate = allDates[allDates.length - 1];
+    console.log(`splitDataByMonths: Chat update date range: ${minDate.toISOString()} to ${maxDate.toISOString()}`);
+    console.log(`splitDataByMonths: Time span: ${Math.round((maxDate - minDate) / (1000 * 60 * 60 * 24))} days`);
+  }
+  
+  // Group chats by month based on updatedAtUTC
+  for (const chat of chats) {
+    const monthKey = getMonthKey(chat.updatedAtUTC);
+    if (!monthKey) {
+      skippedChats++;
+      console.warn(`splitDataByMonths: Skipped chat with invalid updatedAtUTC: ${chat.updatedAtUTC}, chatId: ${chat.chatId}`);
+      continue;
+    }
+    
+    if (!chatsByMonth.has(monthKey)) {
+      chatsByMonth.set(monthKey, []);
+      chatIdsByMonth.set(monthKey, new Set());
+      monthKeySamples.set(monthKey, chat.updatedAtUTC);
+      console.log(`splitDataByMonths: New month key found: ${monthKey} from chat updatedAtUTC: ${chat.updatedAtUTC}`);
+    }
+    chatsByMonth.get(monthKey).push(chat);
+    chatIdsByMonth.get(monthKey).add(chat.chatId);
+  }
+  
+  console.log(`splitDataByMonths: Grouped chats into ${chatsByMonth.size} months, skipped ${skippedChats} chats`);
+  console.log(`splitDataByMonths: Month keys found:`, Array.from(chatsByMonth.keys()));
+  
+  // Log sample dates for each month
+  for (const [monthKey, sampleDate] of monthKeySamples.entries()) {
+    console.log(`splitDataByMonths: Month ${monthKey} sample date: ${sampleDate}, chats: ${chatsByMonth.get(monthKey).length}`);
+  }
+  
+  // Get all unique month keys and sort them chronologically
+  // This will include all months from all years where chats were updated
+  const allMonthKeys = Array.from(chatsByMonth.keys()).sort((a, b) => {
+    // Compare year_month format: "2025_12" vs "2026_01" or "2026_01" vs "2026_02"
+    const [yearA, monthA] = a.split('_').map(Number);
+    const [yearB, monthB] = b.split('_').map(Number);
+    if (yearA !== yearB) return yearA - yearB;
+    return monthA - monthB;
+  });
+  
+  console.log(`splitDataByMonths: Processing ${chats.length} chats total`);
+  console.log(`splitDataByMonths: Found ${allMonthKeys.length} unique months across all years: ${allMonthKeys.join(', ')}`);
+  
+  // Create a file for each month that has chats
+  // Messages are included based on which chat they belong to
+  for (const monthKey of allMonthKeys) {
+    const monthChats = chatsByMonth.get(monthKey) || [];
+    const monthChatIds = chatIdsByMonth.get(monthKey) || new Set();
+    
+    // Skip months with no chats (should not happen due to filtering above, but safety check)
+    if (monthChats.length === 0) {
+      console.log(`splitDataByMonths: Skipping ${monthKey} - no chats`);
+      continue;
+    }
+    
+    // Get messages that belong to chats in this month
+    const monthMessages = messages.filter(msg => monthChatIds.has(msg.chatId));
+    
+    // Include all accounts and indexes in each file (they are shared)
+    const filename = `copilot_ind_${sanitizedAccount}_${monthKey}.json`;
+    
+    console.log(`splitDataByMonths: Creating file for ${monthKey}: ${monthMessages.length} messages, ${monthChats.length} chats`);
+    
+    files.push({
+      filename,
+      data: {
+        accounts,
+        chats: monthChats,
+        messages: monthMessages,
+        indexes,
+        exportDate: toUTCString(),
+        version: '1.0',
+        monthKey
+      }
+    });
+  }
+  
+  console.log(`splitDataByMonths: Created ${files.length} files total for export`);
+  console.log(`splitDataByMonths: File names:`, files.map(f => f.filename).join(', '));
+  
+  return files;
+}
+
+// Split data into N parts
+function splitDataIntoParts(accounts, chats, messages, indexes, partsCount, accountEmail) {
+  const sanitizedAccount = sanitizeAccountForFilename(accountEmail || 'unknown');
+  const dateStr = getDateStringForFilename();
+  const files = [];
+  
+  // Sort messages by timestamp for consistent splitting
+  const sortedMessages = [...messages].sort((a, b) => {
+    const dateA = new Date(a.timestampUTC || 0);
+    const dateB = new Date(b.timestampUTC || 0);
+    return dateA - dateB;
+  });
+  
+  // Calculate sizes
+  const messagesPerPart = Math.ceil(sortedMessages.length / partsCount);
+  
+  // Create chat ID sets for each part to track which chats belong to which part
+  const chatIdsByPart = [];
+  
+  for (let i = 0; i < partsCount; i++) {
+    const startMsg = i * messagesPerPart;
+    const endMsg = Math.min(startMsg + messagesPerPart, sortedMessages.length);
+    const partMessages = sortedMessages.slice(startMsg, endMsg);
+    
+    // Collect chat IDs from messages in this part
+    const partChatIds = new Set();
+    for (const msg of partMessages) {
+      if (msg.chatId) {
+        partChatIds.add(msg.chatId);
+      }
+    }
+    
+    chatIdsByPart.push(partChatIds);
+    
+    // Get chats that have messages in this part
+    const partChats = chats.filter(chat => partChatIds.has(chat.chatId));
+    
+    // Include all accounts and indexes in each file (they are shared)
+    const partNumber = String(i + 1).padStart(2, '0');
+    const filename = `copilot_ind_${sanitizedAccount}_${dateStr}_${partNumber}.json`;
+    
+    files.push({
+      filename,
+      data: {
+        accounts,
+        chats: partChats,
+        messages: partMessages,
+        indexes,
+        exportDate: toUTCString(),
+        version: '1.0',
+        partNumber: i + 1,
+        totalParts: partsCount
+      }
+    });
+  }
+  
+  return files;
+}
+
+async function exportDatabase(strategy = 'single', partsCount = null) {
   const db = await initDB();
   
   const accounts = await new Promise((resolve, reject) => {
@@ -3052,14 +3277,48 @@ async function exportDatabase() {
     request.onerror = () => reject(request.error);
   });
   
-  return {
-    accounts,
-    chats,
-    messages,
-    indexes,
-    exportDate: toUTCString(),
-    version: '1.0'
-  };
+  // Get account email for filename
+  const accountEmail = accounts.length > 0 ? accounts[0].email : null;
+  
+  console.log(`exportDatabase: Strategy: ${strategy}, Messages: ${messages.length}, Chats: ${chats.length}, AccountEmail: ${accountEmail}`);
+  
+  if (strategy === 'single') {
+    return {
+      accounts,
+      chats,
+      messages,
+      indexes,
+      exportDate: toUTCString(),
+      version: '1.0'
+    };
+  } else if (strategy === 'by_month') {
+    console.log(`exportDatabase: Calling splitDataByMonths with ${messages.length} messages`);
+    const files = splitDataByMonths(accounts, chats, messages, indexes, accountEmail);
+    console.log(`exportDatabase: splitDataByMonths returned ${files.length} files`);
+    
+    // Verify files array
+    if (!Array.isArray(files)) {
+      console.error('exportDatabase: splitDataByMonths did not return an array!', typeof files);
+      throw new Error('splitDataByMonths returned invalid data');
+    }
+    
+    if (files.length === 0) {
+      console.warn('exportDatabase: splitDataByMonths returned 0 files!');
+    }
+    
+    // Log each file that will be returned
+    files.forEach((f, i) => {
+      console.log(`exportDatabase: File ${i + 1}: ${f.filename}, messages: ${f.data?.messages?.length || 0}`);
+    });
+    
+    return { files };
+  } else if (strategy === 'by_parts') {
+    const count = partsCount || 2;
+    const files = splitDataIntoParts(accounts, chats, messages, indexes, count, accountEmail);
+    return { files };
+  } else {
+    throw new Error(`Unknown export strategy: ${strategy}`);
+  }
 }
 
 // Helper function to get all data from database
@@ -3348,9 +3607,15 @@ async function importDatabase(data, mergeStrategy = 'replace') {
         const account = data.accounts[i];
         await new Promise((resolve, reject) => {
           const transaction = db.transaction(['accounts'], 'readwrite');
+          // Set up transaction handlers before making requests
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(new Error(`Ошибка транзакции при импорте аккаунта ${i + 1}/${data.accounts.length}: ${transaction.error?.message || 'Неизвестная ошибка'}`));
+          
           const store = transaction.objectStore('accounts');
           const request = store.put(account);
-          request.onsuccess = () => resolve();
+          request.onsuccess = () => {
+            // Request succeeded, transaction will complete automatically
+          };
           request.onerror = () => reject(new Error(`Ошибка импорта аккаунта ${i + 1}/${data.accounts.length}: ${request.error?.message || 'Неизвестная ошибка'}`));
         });
       }
@@ -3364,9 +3629,15 @@ async function importDatabase(data, mergeStrategy = 'replace') {
         const chat = data.chats[i];
         await new Promise((resolve, reject) => {
           const transaction = db.transaction(['chats'], 'readwrite');
+          // Set up transaction handlers before making requests
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(new Error(`Ошибка транзакции при импорте чата ${i + 1}/${data.chats.length}: ${transaction.error?.message || 'Неизвестная ошибка'}`));
+          
           const store = transaction.objectStore('chats');
           const request = store.put(chat);
-          request.onsuccess = () => resolve();
+          request.onsuccess = () => {
+            // Request succeeded, transaction will complete automatically
+          };
           request.onerror = () => reject(new Error(`Ошибка импорта чата ${i + 1}/${data.chats.length} (ID: ${chat.chatId || 'неизвестен'}): ${request.error?.message || 'Неизвестная ошибка'}`));
         });
       }
@@ -3380,9 +3651,15 @@ async function importDatabase(data, mergeStrategy = 'replace') {
         const message = data.messages[i];
         await new Promise((resolve, reject) => {
           const transaction = db.transaction(['messages'], 'readwrite');
+          // Set up transaction handlers before making requests
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(new Error(`Ошибка транзакции при импорте сообщения ${i + 1}/${data.messages.length}: ${transaction.error?.message || 'Неизвестная ошибка'}`));
+          
           const store = transaction.objectStore('messages');
           const request = store.put(message);
-          request.onsuccess = () => resolve();
+          request.onsuccess = () => {
+            // Request succeeded, transaction will complete automatically
+          };
           request.onerror = () => reject(new Error(`Ошибка импорта сообщения ${i + 1}/${data.messages.length}: ${request.error?.message || 'Неизвестная ошибка'}`));
         });
       }
@@ -3396,9 +3673,15 @@ async function importDatabase(data, mergeStrategy = 'replace') {
         const indexData = data.indexes[i];
         await new Promise((resolve, reject) => {
           const transaction = db.transaction(['indexes'], 'readwrite');
+          // Set up transaction handlers before making requests
+          transaction.oncomplete = () => resolve();
+          transaction.onerror = () => reject(new Error(`Ошибка транзакции при импорте индекса ${i + 1}/${data.indexes.length}: ${transaction.error?.message || 'Неизвестная ошибка'}`));
+          
           const store = transaction.objectStore('indexes');
           const request = store.put(indexData);
-          request.onsuccess = () => resolve();
+          request.onsuccess = () => {
+            // Request succeeded, transaction will complete automatically
+          };
           request.onerror = () => reject(new Error(`Ошибка импорта индекса ${i + 1}/${data.indexes.length}: ${request.error?.message || 'Неизвестная ошибка'}`));
         });
       }
@@ -3411,8 +3694,16 @@ async function importDatabase(data, mergeStrategy = 'replace') {
     await mergeDatabase(existingData, data, mergeStrategy);
   }
   
+  // Verify that data was saved correctly
+  const verifyData = await checkHasData();
+  if (!verifyData && (data.chats && data.chats.length > 0)) {
+    console.warn('Import: Warning - data may not have been saved correctly. Verification failed.');
+  }
+  
   // Clear index cache to force reload
   indexCache.clear();
+  
+  console.log('Import: Database import completed successfully. Data persisted to IndexedDB.');
 }
 
 async function resetAccountData(accountEmail) {
@@ -3508,22 +3799,64 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'SEARCH') {
     const { accountEmail, query } = request;
     
-    getOrCreateIndex(accountEmail)
-      .then(async (index) => {
-        // Search returns documents directly with enrich: true
-        // Увеличиваем лимит, чтобы показать все чаты с совпадениями
-        const results = index.search(query, { limit: 1000, enrich: true });
+    // Ищем по всем аккаунтам, если не указан конкретный
+    const searchAllAccounts = !accountEmail;
+    
+    Promise.resolve()
+      .then(async () => {
+        let allAccounts = [];
+        if (searchAllAccounts) {
+          // Получаем все аккаунты из базы
+          allAccounts = await getAllAccounts();
+        } else {
+          // Ищем только по указанному аккаунту
+          const account = await getAccount(accountEmail);
+          if (account) {
+            allAccounts = [account];
+          }
+        }
         
-        const chatIds = [...new Set(results.map(r => r.chatId))];
+        if (allAccounts.length === 0) {
+          sendResponse({ success: true, results: [] });
+          return;
+        }
+        
+        // Ищем во всех индексах аккаунтов
+        const allResults = [];
+        const accountIndexMap = new Map(); // Для отслеживания, какой аккаунт соответствует какому индексу
+        
+        for (const account of allAccounts) {
+          const email = account.email;
+          if (!email) continue;
+          
+          try {
+            const index = await getOrCreateIndex(email);
+            const results = index.search(query, { limit: 1000, enrich: true });
+            
+            // Сохраняем связь между результатами и аккаунтом
+            for (const result of results) {
+              result._accountEmail = email; // Временно сохраняем email аккаунта
+              allResults.push(result);
+            }
+          } catch (error) {
+            console.warn(`Error searching in index for account ${email}:`, error);
+          }
+        }
+        
+        // Группируем результаты по chatId
+        const chatIds = [...new Set(allResults.map(r => r.chatId))];
         const chats = await Promise.all(chatIds.map(id => getChat(id)));
         const chatMap = new Map(chats.map(c => [c.chatId, c]));
         
         const searchResults = [];
         const resultMap = new Map();
         
-        for (const result of results) {
+        for (const result of allResults) {
           const chat = chatMap.get(result.chatId);
           if (!chat) continue;
+          
+          // Определяем accountEmail: сначала из чата, потом из результата поиска, потом fallback
+          const resultAccountEmail = chat.accountEmail || result._accountEmail || accountEmail || null;
           
           if (!resultMap.has(result.chatId)) {
             resultMap.set(result.chatId, {
@@ -3531,6 +3864,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               title: chat.title,
               url: chat.url,
               updatedAtUTC: chat.updatedAtUTC,
+              accountEmail: resultAccountEmail, // Добавляем email аккаунта для различения
               snippets: [],
               matchCount: 0 // Счетчик совпадений в чате
             });
@@ -3582,9 +3916,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
   
   if (request.type === 'EXPORT_DB') {
-    exportDatabase()
-      .then(data => sendResponse({ success: true, data }))
-      .catch(error => sendResponse({ success: false, error: error.message }));
+    const strategy = request.strategy || 'single';
+    const partsCount = request.partsCount || null;
+    
+    exportDatabase(strategy, partsCount)
+      .then(data => {
+        if (strategy === 'by_month' || strategy === 'by_parts') {
+          console.log(`Export: Created ${data.files?.length || 0} files for strategy ${strategy}`);
+          if (data.files && data.files.length > 0) {
+            console.log('Export: File names:', data.files.map(f => f.filename).join(', '));
+          }
+        }
+        sendResponse({ success: true, data, files: data.files });
+      })
+      .catch(error => {
+        console.error('Export error:', error);
+        sendResponse({ success: false, error: error.message });
+      });
     
     return true;
   }

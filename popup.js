@@ -1,5 +1,38 @@
 // Popup script for Copilot Chat Indexer
 
+// JSZip loader - library is loaded via script tag in popup.html
+async function loadJSZip() {
+  // JSZip should be available globally after script tag loads
+  if (typeof JSZip !== 'undefined') {
+    return JSZip;
+  }
+  
+  if (typeof window !== 'undefined' && window.JSZip) {
+    return window.JSZip;
+  }
+  
+  // Wait a bit for script to load if it's still loading
+  return new Promise((resolve, reject) => {
+    let attempts = 0;
+    const maxAttempts = 10;
+    
+    const checkJSZip = () => {
+      attempts++;
+      if (typeof JSZip !== 'undefined') {
+        resolve(JSZip);
+      } else if (typeof window !== 'undefined' && window.JSZip) {
+        resolve(window.JSZip);
+      } else if (attempts < maxAttempts) {
+        setTimeout(checkJSZip, 100);
+      } else {
+        reject(new Error('JSZip library could not be loaded. Please reload the extension.'));
+      }
+    };
+    
+    checkJSZip();
+  });
+}
+
 let currentAccountEmail = null;
 let searchTimeout = null;
 let chatsData = [];
@@ -48,6 +81,11 @@ const mergeDialog = document.getElementById('mergeDialog');
 const mergeDialogCancel = document.getElementById('mergeDialogCancel');
 const mergeDialogConfirm = document.getElementById('mergeDialogConfirm');
 const conflictInfo = document.getElementById('conflictInfo');
+const exportOptionsDialog = document.getElementById('exportOptionsDialog');
+const exportOptionsCancel = document.getElementById('exportOptionsCancel');
+const exportOptionsConfirm = document.getElementById('exportOptionsConfirm');
+const partsInputContainer = document.getElementById('partsInputContainer');
+const partsCountInput = document.getElementById('partsCountInput');
 
 // Tab switching
 function switchTab(tabName) {
@@ -126,16 +164,26 @@ async function getAccountEmail() {
     
     const tabs = await chrome.tabs.query({ url: "*://copilot.microsoft.com/*" });
     if (tabs.length > 0) {
-      const response = await chrome.tabs.sendMessage(tabs[0].id, { action: 'getAccountInfo' });
-      if (response && response.success && response.email) {
-        await chrome.storage.local.set({ copilotAccountEmail: response.email });
-        return response.email;
+      try {
+        const response = await chrome.tabs.sendMessage(tabs[0].id, { action: 'getAccountInfo' });
+        if (response && response.success && response.email) {
+          await chrome.storage.local.set({ copilotAccountEmail: response.email });
+          return response.email;
+        }
+      } catch (msgError) {
+        // Tab might not be ready or content script not loaded - this is OK
+        console.log('Could not get account email from tab (this is normal if Copilot page is not open):', msgError.message);
       }
     }
     
     return null;
   } catch (error) {
-    console.error('Error getting account email:', error);
+    // Don't log as error if it's just a connection issue
+    if (error.message && error.message.includes('Could not establish connection')) {
+      console.log('Account email not available (Copilot page may not be open)');
+    } else {
+      console.error('Error getting account email:', error);
+    }
     return null;
   }
 }
@@ -1250,36 +1298,228 @@ function sanitizeAccountForFilename(accountEmail) {
     .replace(/^_|_$/g, ''); // Remove leading/trailing underscores
 }
 
+// Export Options Dialog
+function showExportOptionsDialog() {
+  if (!exportOptionsDialog) return;
+  exportOptionsDialog.classList.remove('hidden');
+  // Reset to default
+  const singleOption = document.querySelector('input[name="exportStrategy"][value="single"]');
+  if (singleOption) singleOption.checked = true;
+  if (partsInputContainer) partsInputContainer.classList.add('hidden');
+  if (partsCountInput) partsCountInput.value = '2';
+}
+
+function hideExportOptionsDialog() {
+  if (exportOptionsDialog) {
+    exportOptionsDialog.classList.add('hidden');
+  }
+}
+
+// Handle export strategy selection
+function setupExportStrategyHandlers() {
+  const strategyRadios = document.querySelectorAll('input[name="exportStrategy"]');
+  if (strategyRadios.length > 0) {
+    strategyRadios.forEach(radio => {
+      radio.addEventListener('change', (e) => {
+        if (e.target.value === 'by_parts' && partsInputContainer) {
+          partsInputContainer.classList.remove('hidden');
+        } else if (partsInputContainer) {
+          partsInputContainer.classList.add('hidden');
+        }
+      });
+    });
+  }
+}
+
+// Setup handlers when DOM is ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', setupExportStrategyHandlers);
+} else {
+  setupExportStrategyHandlers();
+}
+
 // Export
 if (exportBtn) {
   exportBtn.addEventListener('click', async () => {
+    showExportOptionsDialog();
+  });
+}
+
+// Export Options Dialog handlers
+if (exportOptionsCancel) {
+  exportOptionsCancel.addEventListener('click', () => {
+    hideExportOptionsDialog();
+  });
+}
+
+if (exportOptionsConfirm) {
+  exportOptionsConfirm.addEventListener('click', async () => {
+    if (!exportOptionsDialog) return;
+    
+    const selectedStrategy = document.querySelector('input[name="exportStrategy"]:checked')?.value || 'single';
+    let partsCount = null;
+    
+    if (selectedStrategy === 'by_parts') {
+      partsCount = parseInt(partsCountInput?.value || '2', 10);
+      if (isNaN(partsCount) || partsCount < 2 || partsCount > 100) {
+        setStatus('Ошибка: Количество частей должно быть от 2 до 100', true);
+        return;
+      }
+    }
+    
+    hideExportOptionsDialog();
+    
     try {
-      const response = await chrome.runtime.sendMessage({ type: 'EXPORT_DB' });
+      setStatus('Экспорт базы данных...');
+      
+      const response = await chrome.runtime.sendMessage({ 
+        type: 'EXPORT_DB',
+        strategy: selectedStrategy,
+        partsCount: partsCount
+      });
       
       if (response && response.success) {
-        const dataStr = JSON.stringify(response.data, null, 2);
-        const blob = new Blob([dataStr], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        
-        // Generate filename: copilot_ind_ + sanitized account + date (YYYY-MM-DD)
         const sanitizedAccount = sanitizeAccountForFilename(currentAccountEmail);
-        const dateStr = new Date().toISOString().split('T')[0];
-        a.download = `copilot_ind_${sanitizedAccount}_${dateStr}.json`;
+        const now = new Date();
+        const dateStr = now.toISOString().split('T')[0];
         
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        
-        setStatus('База данных экспортирована');
+        if (selectedStrategy === 'single') {
+          // Single file export - original behavior
+          const dataStr = JSON.stringify(response.data, null, 2);
+          const blob = new Blob([dataStr], { type: 'application/json' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `copilot_ind_${sanitizedAccount}_${dateStr}.json`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          setStatus('База данных экспортирована');
+        } else if (selectedStrategy === 'by_month' || selectedStrategy === 'by_parts') {
+          // Multiple files export - create ZIP archive
+          const files = response.files || [];
+          console.log(`Export: Received response with files array:`, response);
+          console.log(`Export: Received ${files.length} files to archive`);
+          console.log(`Export: File names:`, files.map(f => f.filename));
+          
+          // Debug: Check file contents
+          if (files.length > 0) {
+            console.log(`Export: First file has ${files[0].data?.messages?.length || 0} messages`);
+            if (files.length > 1) {
+              console.log(`Export: Second file has ${files[1].data?.messages?.length || 0} messages`);
+            }
+          }
+          
+          if (files.length === 0) {
+            setStatus('Ошибка: Не удалось создать файлы для экспорта', true);
+            return;
+          }
+          
+          setStatus(`Создание архива из ${files.length} файл(ов)...`);
+          
+          // Log to console for debugging (open popup console with right-click -> Inspect)
+          console.log('=== EXPORT DEBUG INFO ===');
+          console.log('Files received:', files.length);
+          console.log('File details:', files.map(f => ({
+            filename: f.filename,
+            messages: f.data?.messages?.length || 0,
+            chats: f.data?.chats?.length || 0
+          })));
+          console.log('=======================');
+          
+          try {
+            // Load JSZip library
+            const zipLib = await loadJSZip();
+            
+            // Create ZIP archive
+            const zip = new zipLib();
+            
+            console.log(`Export: Starting to add ${files.length} files to ZIP archive`);
+            
+            // Add ALL files to the archive BEFORE generating
+            // This ensures all months/parts are included
+            for (let i = 0; i < files.length; i++) {
+              const fileData = files[i];
+              
+              if (!fileData || !fileData.data) {
+                console.warn(`Export: Skipping invalid file at index ${i}`);
+                continue;
+              }
+              
+              const dataStr = JSON.stringify(fileData.data, null, 2);
+              const messagesCount = fileData.data?.messages?.length || 0;
+              const chatsCount = fileData.data?.chats?.length || 0;
+              
+              // Add file to archive
+              zip.file(fileData.filename, dataStr);
+              console.log(`Export: Added file ${i + 1}/${files.length}: ${fileData.filename} (${messagesCount} messages, ${chatsCount} chats)`);
+            }
+            
+            // Verify all files were added BEFORE generating ZIP
+            const zipFiles = Object.keys(zip.files || {});
+            console.log(`Export: ZIP archive contains ${zipFiles.length} files before generation:`, zipFiles);
+            
+            if (zipFiles.length !== files.length) {
+              console.error(`Export: WARNING! Expected ${files.length} files, but only ${zipFiles.length} were added to archive!`);
+              setStatus(`Предупреждение: В архив добавлено ${zipFiles.length} из ${files.length} файлов`, true);
+            }
+            
+            // Generate ZIP file ONLY AFTER all files are added
+            setStatus(`Генерация ZIP архива из ${zipFiles.length} файл(ов)...`);
+            const zipBlob = await zip.generateAsync({ 
+              type: 'blob',
+              compression: 'DEFLATE',
+              compressionOptions: { level: 6 }
+            });
+            
+            // Verify after generation
+            console.log(`Export: ZIP archive generated, size: ${(zipBlob.size / 1024 / 1024).toFixed(2)} MB`);
+            
+            // Create download link for ZIP
+            const sanitizedAccount = sanitizeAccountForFilename(currentAccountEmail);
+            const now = new Date();
+            const dateStr = now.toISOString().split('T')[0];
+            
+            let zipFilename;
+            if (selectedStrategy === 'by_month') {
+              zipFilename = `copilot_ind_${sanitizedAccount}_by_month_${dateStr}.zip`;
+            } else {
+              zipFilename = `copilot_ind_${sanitizedAccount}_by_parts_${dateStr}.zip`;
+            }
+            
+            const url = URL.createObjectURL(zipBlob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = zipFilename;
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            console.log(`Export: Successfully created and downloaded ZIP archive: ${zipFilename}`);
+            setStatus(`Экспортировано ${files.length} файл(ов) в архив ${zipFilename}`);
+          } catch (error) {
+            console.error('Export: Error creating ZIP archive:', error);
+            setStatus(`Ошибка создания архива: ${error.message}`, true);
+          }
+        }
       } else {
         setStatus(`Ошибка экспорта: ${response?.error || 'Неизвестная ошибка'}`, true);
       }
     } catch (error) {
       console.error('Export error:', error);
       setStatus(`Ошибка: ${error.message}`, true);
+    }
+  });
+}
+
+// Close export dialog on overlay click
+if (exportOptionsDialog) {
+  exportOptionsDialog.addEventListener('click', (e) => {
+    if (e.target === exportOptionsDialog) {
+      hideExportOptionsDialog();
     }
   });
 }
@@ -1370,6 +1610,16 @@ async function performImport(data, mergeStrategy = 'replace') {
         await chrome.storage.local.set({ copilotAccountEmail: currentAccountEmail });
       }
       
+      // Проверяем, что данные действительно сохранены и доступны
+      const verifyResponse = await chrome.runtime.sendMessage({ type: 'CHECK_DATA' });
+      if (verifyResponse && verifyResponse.hasData) {
+        console.log('Import: Data verified - database contains data after import');
+        setStatus(`База данных импортирована и сохранена${strategyText}. Данные доступны для использования.`);
+      } else {
+        console.warn('Import: Warning - data verification failed after import');
+        setStatus(`База данных импортирована${strategyText}. Проверка данных...`, true);
+      }
+      
       // Переключаемся на вкладку поиска
       setTimeout(() => {
         if (tabSearch) tabSearch.disabled = false;
@@ -1417,40 +1667,20 @@ if (importBtn && importFile) {
   });
 
   importFile.addEventListener('change', async (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
+    const files = Array.from(event.target.files || []);
+    if (files.length === 0) return;
     
-    const reader = new FileReader();
-    reader.onload = async (e) => {
-      try {
-        // Проверка на пустой файл
-        if (!e.target.result || e.target.result.trim().length === 0) {
-          setStatus('Ошибка: Файл пуст. Выберите файл с данными для импорта.', true);
-          importFile.value = '';
-          return;
-        }
-        
-        let data;
-        try {
-          data = JSON.parse(e.target.result);
-        } catch (parseError) {
-          if (parseError instanceof SyntaxError) {
-            setStatus('Ошибка: Файл не является валидным JSON. Проверьте, что файл не поврежден и был экспортирован из этого расширения.', true);
-          } else {
-            setStatus(`Ошибка парсинга JSON: ${parseError.message}`, true);
-          }
-          importFile.value = '';
-          return;
-        }
-        
+    try {
+      setStatus(`Чтение ${files.length} файл(ов)...`);
+      
+      // Helper function to validate data structure
+      const validateDataStructure = (data, filename) => {
         // Проверка, что это объект
         if (typeof data !== 'object' || data === null || Array.isArray(data)) {
-          setStatus('Ошибка: Неверный формат данных. Ожидается объект с полями accounts, chats, messages, indexes.', true);
-          importFile.value = '';
-          return;
+          throw new Error(`Неверный формат данных в файле ${filename}. Ожидается объект с полями accounts, chats, messages, indexes.`);
         }
         
-        // Проверка наличия обязательных полей сразу после парсинга
+        // Проверка наличия обязательных полей
         const missingFields = [];
         if (!data.accounts) missingFields.push('accounts');
         if (!data.chats) missingFields.push('chats');
@@ -1458,66 +1688,272 @@ if (importBtn && importFile) {
         if (!data.indexes) missingFields.push('indexes');
         
         if (missingFields.length > 0) {
-          setStatus(`Ошибка: Неверный формат данных импорта. Отсутствуют обязательные поля: ${missingFields.join(', ')}. Убедитесь, что файл был экспортирован из этого расширения.`, true);
-          importFile.value = '';
-          return;
+          throw new Error(`Неверный формат данных в файле ${filename}. Отсутствуют обязательные поля: ${missingFields.join(', ')}.`);
         }
         
         // Проверка типов данных
         if (!Array.isArray(data.accounts) || !Array.isArray(data.chats) || 
             !Array.isArray(data.messages) || !Array.isArray(data.indexes)) {
-          setStatus('Ошибка: Неверный формат данных. Поля accounts, chats, messages, indexes должны быть массивами.', true);
-          importFile.value = '';
-          return;
+          throw new Error(`Неверный формат данных в файле ${filename}. Поля accounts, chats, messages, indexes должны быть массивами.`);
         }
         
-        console.log('Import: File parsed successfully, accounts:', data.accounts.length, 
-                    'chats:', data.chats.length, 
-                    'messages:', data.messages.length, 
-                    'indexes:', data.indexes.length);
-        
-        // Check if database has existing data
-        const hasDataResult = await hasData();
-        
-        if (!hasDataResult) {
-          // No existing data, import directly
-          await performImport(data, 'replace');
+        return true;
+      };
+      
+      // Helper function to parse JSON file
+      const parseJSONFile = async (file) => {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            try {
+              if (!e.target.result || e.target.result.trim().length === 0) {
+                reject(new Error(`Файл ${file.name} пуст`));
+                return;
+              }
+              
+              let data;
+              try {
+                data = JSON.parse(e.target.result);
+              } catch (parseError) {
+                if (parseError instanceof SyntaxError) {
+                  reject(new Error(`Файл ${file.name} не является валидным JSON`));
+                } else {
+                  reject(new Error(`Ошибка парсинга JSON в файле ${file.name}: ${parseError.message}`));
+                }
+                return;
+              }
+              
+              // Validate structure using common function
+              validateDataStructure(data, file.name);
+              
+              resolve(data);
+            } catch (error) {
+              reject(error);
+            }
+          };
+          reader.onerror = () => {
+            reject(new Error(`Ошибка чтения файла ${file.name}`));
+          };
+          reader.readAsText(file);
+        });
+      };
+      
+      // Process all files (including ZIP archives)
+      const allFileData = [];
+      let processedFilesCount = 0;
+      let successfulFilesCount = 0;
+      let failedFilesCount = 0;
+      const failedFiles = [];
+      
+      for (const file of files) {
+        processedFilesCount++;
+        if (file.name.toLowerCase().endsWith('.zip')) {
+          // Handle ZIP archive
+          setStatus(`Распаковка архива ${file.name} (${processedFilesCount}/${files.length})...`);
+          try {
+            const zipLib = await loadJSZip();
+            const zipData = await file.arrayBuffer();
+            const zip = await zipLib.loadAsync(zipData);
+            
+            // Extract all JSON files from ZIP
+            const jsonFiles = [];
+            let zipFilesProcessed = 0;
+            let zipFilesSuccessful = 0;
+            let zipFilesFailed = 0;
+            
+            for (const filename in zip.files) {
+              const zipFile = zip.files[filename];
+              if (!zipFile.dir && filename.toLowerCase().endsWith('.json')) {
+                zipFilesProcessed++;
+                setStatus(`Обработка файла ${zipFilesProcessed} из архива ${file.name}...`);
+                try {
+                  const content = await zipFile.async('string');
+                  
+                  if (!content || content.trim().length === 0) {
+                    zipFilesFailed++;
+                    console.warn(`Skipping empty JSON file in ZIP: ${filename}`);
+                    continue;
+                  }
+                  
+                  let data;
+                  try {
+                    data = JSON.parse(content);
+                  } catch (parseError) {
+                    zipFilesFailed++;
+                    console.warn(`Skipping invalid JSON file in ZIP: ${filename}`, parseError);
+                    continue;
+                  }
+                  
+                  // Validate structure using common function
+                  try {
+                    validateDataStructure(data, filename);
+                    jsonFiles.push(data);
+                    zipFilesSuccessful++;
+                  } catch (validationError) {
+                    zipFilesFailed++;
+                    console.warn(`Skipping invalid data structure in ZIP file: ${filename}`, validationError);
+                  }
+                } catch (e) {
+                  zipFilesFailed++;
+                  console.warn(`Skipping file in ZIP due to error: ${filename}`, e);
+                }
+              }
+            }
+            
+            if (jsonFiles.length === 0) {
+              if (zipFilesProcessed === 0) {
+                throw new Error(`В архиве ${file.name} не найдено JSON файлов`);
+              } else {
+                throw new Error(`В архиве ${file.name} не найдено валидных JSON файлов (обработано: ${zipFilesProcessed}, успешно: ${zipFilesSuccessful}, ошибок: ${zipFilesFailed})`);
+              }
+            }
+            
+            allFileData.push(...jsonFiles);
+            successfulFilesCount++;
+            console.log(`Import: Extracted ${jsonFiles.length} JSON files from ZIP ${file.name} (успешно: ${zipFilesSuccessful}, ошибок: ${zipFilesFailed})`);
+            
+            if (zipFilesFailed > 0) {
+              setStatus(`Архив ${file.name}: обработано ${zipFilesSuccessful} из ${zipFilesProcessed} файлов (${zipFilesFailed} ошибок)`);
+            }
+          } catch (error) {
+            console.error(`Import: Error processing ZIP file ${file.name}:`, error);
+            failedFilesCount++;
+            failedFiles.push({ name: file.name, error: error.message });
+            // Continue processing other files instead of throwing
+            setStatus(`Ошибка обработки архива ${file.name}: ${error.message}`, true);
+          }
         } else {
-          // Has existing data, check for conflicts and show dialog
-          pendingImportData = data;
-          
-          // Check for conflicts
-          const conflictResponse = await chrome.runtime.sendMessage({
-            type: 'CHECK_IMPORT_CONFLICTS',
-            data
-          });
-          
-          if (conflictResponse && conflictResponse.success) {
-            showMergeDialog(conflictResponse.conflictCount || 0);
-          } else {
-            // If check fails, still show dialog
-            showMergeDialog(0);
+          // Handle regular JSON file
+          setStatus(`Обработка файла ${file.name} (${processedFilesCount}/${files.length})...`);
+          try {
+            const data = await parseJSONFile(file);
+            allFileData.push(data);
+            successfulFilesCount++;
+          } catch (error) {
+            console.error(`Import: Error processing file ${file.name}:`, error);
+            failedFilesCount++;
+            failedFiles.push({ name: file.name, error: error.message });
+            // Continue processing other files instead of throwing
+            setStatus(`Ошибка обработки файла ${file.name}: ${error.message}`, true);
           }
         }
-      } catch (error) {
-        console.error('Import file read error:', error);
-        // Различаем типы ошибок
-        if (error.message && error.message.includes('Invalid import data format')) {
-          setStatus('Ошибка: Неверный формат данных импорта. Убедитесь, что файл был экспортирован из этого расширения и содержит все необходимые поля.', true);
-        } else {
-          setStatus(`Ошибка импорта: ${error.message || 'Неизвестная ошибка'}`, true);
-        }
-        importFile.value = '';
       }
-    };
-    
-    reader.onerror = () => {
-      console.error('FileReader error');
-      setStatus('Ошибка чтения файла', true);
+      
+      // Show final statistics
+      if (failedFilesCount > 0) {
+        const failedNames = failedFiles.map(f => f.name).join(', ');
+        setStatus(`Обработано файлов: ${successfulFilesCount} успешно, ${failedFilesCount} с ошибками. Проблемные файлы: ${failedNames}`, true);
+      } else {
+        setStatus(`Обработано файлов: ${successfulFilesCount} успешно`);
+      }
+      
+      if (allFileData.length === 0) {
+        setStatus('Ошибка: Не найдено валидных данных для импорта', true);
+        importFile.value = '';
+        return;
+      }
+      
+      const fileDataArray = allFileData;
+      
+      // Merge all file data
+      const mergedData = {
+        accounts: [],
+        chats: [],
+        messages: [],
+        indexes: []
+      };
+      
+      // Merge accounts from all files, avoiding duplicates by email
+      const accountEmails = new Set();
+      for (const fileData of fileDataArray) {
+        if (fileData.accounts && Array.isArray(fileData.accounts)) {
+          for (const account of fileData.accounts) {
+            if (account.email && !accountEmails.has(account.email)) {
+              mergedData.accounts.push(account);
+              accountEmails.add(account.email);
+            }
+          }
+        }
+      }
+      
+      // Merge chats, messages, indexes from all files
+      const chatIds = new Set();
+      const messageIds = new Set();
+      // accountEmails already declared above for accounts merging
+      
+      for (const fileData of fileDataArray) {
+        // Merge chats (avoid duplicates by chatId)
+        if (fileData.chats) {
+          for (const chat of fileData.chats) {
+            if (!chatIds.has(chat.chatId)) {
+              mergedData.chats.push(chat);
+              chatIds.add(chat.chatId);
+            }
+          }
+        }
+        
+        // Merge messages (avoid duplicates by id)
+        if (fileData.messages) {
+          for (const msg of fileData.messages) {
+            if (!messageIds.has(msg.id)) {
+              mergedData.messages.push(msg);
+              messageIds.add(msg.id);
+            }
+          }
+        }
+        
+        // Merge indexes (by accountEmail, keep latest)
+        if (fileData.indexes) {
+          for (const idx of fileData.indexes) {
+            if (idx.accountEmail && !accountEmails.has(idx.accountEmail)) {
+              mergedData.indexes.push(idx);
+              accountEmails.add(idx.accountEmail);
+            } else if (idx.accountEmail) {
+              // Replace existing index for this account
+              const existingIndex = mergedData.indexes.find(i => i.accountEmail === idx.accountEmail);
+              if (existingIndex) {
+                const index = mergedData.indexes.indexOf(existingIndex);
+                mergedData.indexes[index] = idx;
+              }
+            }
+          }
+        }
+      }
+      
+      console.log('Import: Merged data from', fileDataArray.length, 'files:', 
+                  'accounts:', mergedData.accounts.length,
+                  'chats:', mergedData.chats.length, 
+                  'messages:', mergedData.messages.length, 
+                  'indexes:', mergedData.indexes.length);
+      
+      // Check if database has existing data
+      const hasDataResult = await hasData();
+      
+      if (!hasDataResult) {
+        // No existing data, import directly
+        await performImport(mergedData, 'replace');
+      } else {
+        // Has existing data, check for conflicts and show dialog
+        pendingImportData = mergedData;
+        
+        // Check for conflicts
+        const conflictResponse = await chrome.runtime.sendMessage({
+          type: 'CHECK_IMPORT_CONFLICTS',
+          data: mergedData
+        });
+        
+        if (conflictResponse && conflictResponse.success) {
+          showMergeDialog(conflictResponse.conflictCount || 0);
+        } else {
+          // If check fails, still show dialog
+          showMergeDialog(0);
+        }
+      }
+    } catch (error) {
+      console.error('Import file read error:', error);
+      setStatus(`Ошибка импорта: ${error.message || 'Неизвестная ошибка'}`, true);
       importFile.value = '';
-    };
-    
-    reader.readAsText(file);
+    }
   });
 }
 
@@ -1604,11 +2040,7 @@ async function performReset() {
 
 // Search
 function performSearch(query) {
-  if (!currentAccountEmail) {
-    setStatus('Аккаунт не определен', true);
-    return;
-  }
-  
+  // Убираем проверку currentAccountEmail - теперь поиск работает по всем аккаунтам
   if (query.length < 2) {
     searchResults.innerHTML = '';
     searchEmpty.style.display = 'block';
@@ -1618,9 +2050,10 @@ function performSearch(query) {
   searchEmpty.style.display = 'none';
   searchResults.innerHTML = '<div style="padding: 12px; text-align: center; color: #666;">Поиск...</div>';
   
+  // Передаем null для поиска по всем аккаунтам, или currentAccountEmail для поиска только по текущему
   chrome.runtime.sendMessage({
     type: 'SEARCH',
-    accountEmail: currentAccountEmail,
+    accountEmail: null, // null означает поиск по всем аккаунтам
     query
   }, (response) => {
     if (chrome.runtime.lastError) {
@@ -1699,6 +2132,72 @@ function getDaysText(count) {
   return 'дней';
 }
 
+// Функция для генерации пастельного цвета на основе email
+function getPastelColorForAccount(email) {
+  if (!email) return '#f0f0f0';
+  
+  // Генерируем хеш из email для стабильного цвета
+  let hash = 0;
+  for (let i = 0; i < email.length; i++) {
+    hash = email.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  
+  // Генерируем пастельные цвета (высокая яркость, низкая насыщенность)
+  const hue = Math.abs(hash) % 360;
+  // Используем HSL для пастельных тонов: высокая яркость (85-95%), средняя насыщенность (40-60%)
+  const saturation = 45 + (Math.abs(hash) % 20); // 45-65%
+  const lightness = 88 + (Math.abs(hash) % 7); // 88-95%
+  
+  return `hsl(${hue}, ${saturation}%, ${lightness}%)`;
+}
+
+// Функция для применения пастельных фонов к буквам в HTML тексте
+function applyPastelBackgroundToText(html, accountEmail, colorMap) {
+  if (!accountEmail || !colorMap || !colorMap.has(accountEmail)) {
+    return html;
+  }
+  
+  const color = colorMap.get(accountEmail);
+  
+  // Создаем временный элемент для парсинга HTML
+  const tempDiv = document.createElement('div');
+  tempDiv.innerHTML = html;
+  
+  // Рекурсивно обрабатываем все текстовые узлы
+  function processNode(node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent;
+      if (text && text.trim().length > 0) {
+        // Заменяем каждую букву на span с фоном
+        const fragment = document.createDocumentFragment();
+        for (let i = 0; i < text.length; i++) {
+          const char = text[i];
+          const span = document.createElement('span');
+          span.style.backgroundColor = color;
+          span.style.padding = '0 1px';
+          span.style.borderRadius = '2px';
+          span.style.display = 'inline-block';
+          span.textContent = char;
+          fragment.appendChild(span);
+        }
+        if (node.parentNode) {
+          node.parentNode.replaceChild(fragment, node);
+        }
+      }
+    } else if (node.nodeType === Node.ELEMENT_NODE) {
+      // Рекурсивно обрабатываем дочерние узлы (копируем массив, так как он может измениться)
+      const children = Array.from(node.childNodes);
+      children.forEach(processNode);
+    }
+  }
+  
+  // Обрабатываем все узлы
+  const children = Array.from(tempDiv.childNodes);
+  children.forEach(processNode);
+  
+  return tempDiv.innerHTML;
+}
+
 function displaySearchResults(results) {
   if (!results || results.length === 0) {
     searchResults.innerHTML = '';
@@ -1718,6 +2217,20 @@ function displaySearchResults(results) {
     searchResults.removeEventListener('scroll', oldScrollHandler);
   }
   
+  // Определяем уникальные аккаунты из результатов
+  const uniqueAccounts = new Set();
+  results.forEach(result => {
+    if (result.accountEmail) {
+      uniqueAccounts.add(result.accountEmail);
+    }
+  });
+  
+  // Создаем карту цветов для аккаунтов
+  const accountColorMap = new Map();
+  uniqueAccounts.forEach(email => {
+    accountColorMap.set(email, getPastelColorForAccount(email));
+  });
+  
   // Заголовок с кнопкой "Свернуть все/Развернуть все"
   const resultsHeader = document.createElement('div');
   resultsHeader.className = 'search-results-header';
@@ -1729,11 +2242,58 @@ function displaySearchResults(results) {
   resultsHeader.style.transition = 'transform 0.3s ease-in-out, opacity 0.3s ease-in-out';
   resultsHeader.style.opacity = '1';
   
+  // Контейнер для счетчика и легенды
+  const headerLeft = document.createElement('div');
+  headerLeft.style.display = 'flex';
+  headerLeft.style.flexDirection = 'column';
+  headerLeft.style.gap = '4px';
+  headerLeft.style.flex = '1';
+  
   const resultsCount = document.createElement('div');
   resultsCount.className = 'search-results-count';
   resultsCount.style.fontSize = '12px';
   resultsCount.style.color = '#666';
   resultsCount.textContent = `Найдено чатов: ${results.length}`;
+  
+  headerLeft.appendChild(resultsCount);
+  
+  // Легенда аккаунтов (только если аккаунтов больше 1)
+  if (uniqueAccounts.size > 1) {
+    const legendContainer = document.createElement('div');
+    legendContainer.className = 'search-accounts-legend';
+    legendContainer.style.display = 'flex';
+    legendContainer.style.flexWrap = 'wrap';
+    legendContainer.style.gap = '6px';
+    legendContainer.style.fontSize = '10px';
+    legendContainer.style.marginTop = '2px';
+    
+    Array.from(uniqueAccounts).forEach(email => {
+      const legendItem = document.createElement('div');
+      legendItem.style.display = 'flex';
+      legendItem.style.alignItems = 'center';
+      legendItem.style.gap = '4px';
+      
+      const colorBox = document.createElement('span');
+      colorBox.style.width = '12px';
+      colorBox.style.height = '12px';
+      colorBox.style.borderRadius = '2px';
+      colorBox.style.backgroundColor = accountColorMap.get(email);
+      colorBox.style.border = '1px solid rgba(0,0,0,0.1)';
+      colorBox.style.flexShrink = '0';
+      
+      const emailLabel = document.createElement('span');
+      emailLabel.style.color = '#666';
+      // Показываем короткий email (до @ или первые 15 символов)
+      const shortEmail = email.includes('@') ? email.split('@')[0] : email.substring(0, 15);
+      emailLabel.textContent = shortEmail;
+      
+      legendItem.appendChild(colorBox);
+      legendItem.appendChild(emailLabel);
+      legendContainer.appendChild(legendItem);
+    });
+    
+    headerLeft.appendChild(legendContainer);
+  }
   
   const toggleAllBtn = document.createElement('button');
   toggleAllBtn.className = 'search-toggle-all-btn';
@@ -1744,13 +2304,15 @@ function displaySearchResults(results) {
   toggleAllBtn.style.cursor = 'pointer';
   toggleAllBtn.style.fontSize = '11px';
   toggleAllBtn.style.color = '#666';
+  toggleAllBtn.style.alignSelf = 'flex-start';
+  toggleAllBtn.style.marginTop = '2px';
   toggleAllBtn.textContent = 'Свернуть все';
   toggleAllBtn.addEventListener('click', (e) => {
     e.stopPropagation();
     toggleAllChats(results);
   });
   
-  resultsHeader.appendChild(resultsCount);
+  resultsHeader.appendChild(headerLeft);
   resultsHeader.appendChild(toggleAllBtn);
   searchResults.appendChild(resultsHeader);
   
@@ -1828,6 +2390,16 @@ function displaySearchResults(results) {
     title.style.textDecoration = 'underline';
     title.style.color = '#1a66d4';
     title.style.cursor = 'pointer';
+    
+    // Применяем пастельный фон к заголовку, если аккаунтов больше 1
+    if (uniqueAccounts.size > 1 && result.accountEmail && accountColorMap.has(result.accountEmail)) {
+      const accountColor = accountColorMap.get(result.accountEmail);
+      title.style.backgroundColor = accountColor;
+      title.style.padding = '2px 6px';
+      title.style.borderRadius = '4px';
+      title.style.display = 'inline-block';
+    }
+    
     title.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -1910,7 +2482,7 @@ function displaySearchResults(results) {
       for (const snippet of result.snippets) {
         const snippetEl = document.createElement('div');
         snippetEl.className = 'search-result-snippet';
-        snippetEl.innerHTML = snippet;
+        snippetEl.innerHTML = snippet; // Убрали применение пастельных цветов к тексту
         snippets.appendChild(snippetEl);
       }
     } else {

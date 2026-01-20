@@ -64,7 +64,7 @@
         
         <button id="exportBtn" class="action-button">Сохранить базу</button>
         <button id="importBtn" class="action-button">Загрузить базу</button>
-        <input type="file" id="importFile" accept=".json" style="display: none;" />
+        <input type="file" id="importFile" accept=".json,.zip" multiple style="display: none;" />
         <button id="resetBtn" class="action-button danger">Сбросить базу</button>
         <div id="indexProgress" class="progress hidden"></div>
         <div id="diagnosticsInfo" class="diagnostics-info hidden"></div>
@@ -138,6 +138,52 @@
       </div>
     </div>
 
+    <!-- Export Options Dialog Modal -->
+    <div id="exportOptionsDialog" class="modal-overlay hidden">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3 class="modal-title">Выберите способ сохранения</h3>
+        </div>
+        <div class="modal-body">
+          <div class="modal-options">
+            <label class="modal-option">
+              <input type="radio" name="exportStrategy" value="single" checked />
+              <span class="modal-option-label">
+                <strong>Сохранить одним файлом</strong>
+                <span class="modal-option-desc">Все данные будут сохранены в один файл</span>
+              </span>
+            </label>
+            <label class="modal-option">
+              <input type="radio" name="exportStrategy" value="by_month" />
+              <span class="modal-option-label">
+                <strong>По месяцам</strong>
+                <span class="modal-option-desc">Данные будут разделены по месяцам и сохранены в ZIP архив</span>
+              </span>
+            </label>
+            <label class="modal-option">
+              <input type="radio" name="exportStrategy" value="by_parts" />
+              <span class="modal-option-label">
+                <strong>На несколько частей</strong>
+                <span class="modal-option-desc">Данные будут разделены на указанное количество частей и сохранены в ZIP архив</span>
+              </span>
+            </label>
+          </div>
+          <div id="partsInputContainer" class="modal-input-container hidden" style="margin-top: 16px;">
+            <label for="partsCountInput" style="display: block; margin-bottom: 8px; font-size: 13px; color: #333; font-weight: 500;">
+              Количество частей:
+            </label>
+            <input type="number" id="partsCountInput" min="2" max="100" value="2" 
+                   style="width: 100%; padding: 8px; border: 1px solid #c7c7c7; border-radius: 4px; font-size: 13px;" />
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button id="exportOptionsCancel" class="action-button">Отмена</button>
+          <button id="exportOptionsConfirm" class="action-button">Сохранить</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="lib/jszip.min.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>
