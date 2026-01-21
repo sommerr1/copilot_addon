@@ -438,6 +438,224 @@ function extractMessagesFromChat() {
   return messages;
 }
 
+// Функция для извлечения HTML сообщений из чата (с сохранением форматирования и порядка)
+function extractChatMessagesWithHtml() {
+  const messages = [];
+  const messageElements = new Map(); // Для сохранения порядка DOM
+
+  // Helper function to clean HTML while preserving formatting
+  function cleanMessageHtml(html) {
+    if (!html) return '';
+    
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    
+    // Remove UI elements
+    const selectorsToRemove = [
+      'img',
+      '.sr-only',
+      '[data-testid="sticky-header"]',
+      '[data-testid="date-divider"]',
+      'svg',
+      'button:not([data-content])',
+      'nav',
+      'header',
+      'footer',
+      'script',
+      'style',
+      '[aria-hidden="true"]',
+      '.hidden',
+      '[style*="display: none"]'
+    ];
+    
+    selectorsToRemove.forEach(sel => {
+      try {
+        doc.querySelectorAll(sel).forEach(el => el.remove());
+      } catch (e) {
+        // Ignore
+      }
+    });
+    
+    // Удаляем атрибуты стилей, но сохраняем структуру
+    doc.querySelectorAll('*').forEach(el => {
+      // Удаляем инлайн стили, data-атрибуты (кроме важных), классы
+      el.removeAttribute('style');
+      el.removeAttribute('class');
+      Array.from(el.attributes).forEach(attr => {
+        if (attr.name.startsWith('data-') && !['data-content'].includes(attr.name)) {
+          el.removeAttribute(attr.name);
+        }
+      });
+    });
+    
+    // Удаляем пустые элементы (кроме форматирующих тегов)
+    const formattingTags = ['p', 'br', 'strong', 'em', 'code', 'pre', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a', 'blockquote', 'div', 'span'];
+    doc.querySelectorAll('*').forEach(el => {
+      const tagName = el.tagName?.toLowerCase();
+      // Удаляем только если элемент пустой и не является форматирующим тегом
+      if (el.children.length === 0 && !el.textContent?.trim() && !formattingTags.includes(tagName)) {
+        el.remove();
+      }
+    });
+    
+    // Получаем очищенный HTML
+    let cleanedHtml = doc.body.innerHTML || '';
+    
+    // Нормализуем пробелы, но сохраняем структуру
+    cleanedHtml = cleanedHtml
+      .replace(/>\s+</g, '><') // Пробелы между тегами
+      .trim();
+    
+    return cleanedHtml;
+  }
+  
+  // Извлекаем все сообщения в порядке появления в DOM
+  // Используем общий селектор для всех сообщений
+  const allMessageElements = document.querySelectorAll('[role="article"]');
+  
+  for (const msgEl of allMessageElements) {
+    // Определяем тип сообщения
+    const isUser = msgEl.querySelector('[data-content="user-message"]') || 
+                   msgEl.getAttribute('aria-labelledby')?.includes('user-message') ||
+                   msgEl.querySelector('[data-testid*="user-message"]') ||
+                   msgEl.classList.toString().includes('user-message');
+    
+    const isAssistant = msgEl.querySelector('[data-content="ai-message"]') ||
+                        msgEl.getAttribute('aria-labelledby')?.includes('ai-message') ||
+                        msgEl.getAttribute('aria-labelledby')?.includes('author') ||
+                        msgEl.querySelector('[data-testid*="ai-message"]') ||
+                        msgEl.classList.toString().includes('ai-message') ||
+                        msgEl.classList.toString().includes('assistant-message');
+    
+    if (!isUser && !isAssistant) {
+      continue;
+    }
+    
+    // Для ответов Copilot ищем более широкий контейнер с контентом
+    let contentElement = msgEl;
+    if (isAssistant) {
+      // Ищем контейнер с основным контентом ответа
+      const contentContainer = msgEl.querySelector('[data-content="ai-message"]') || 
+                              msgEl.querySelector('[class*="message-content"]') ||
+                              msgEl.querySelector('[class*="response-content"]') ||
+                              msgEl;
+      contentElement = contentContainer;
+    }
+    
+    const html = cleanMessageHtml(contentElement.innerHTML);
+    // Берем весь текст целиком, не разбивая на предложения
+    const text = contentElement.textContent?.trim() || '';
+    
+    if (text.length > 0) {
+      const timeEl = msgEl.querySelector('time') || 
+                    msgEl.querySelector('[data-testid*="date"]') ||
+                    msgEl.closest('[role="article"]')?.querySelector('time');
+      const timestamp = timeEl ? (timeEl.getAttribute('datetime') || timeEl.textContent) : null;
+      
+      // Сохраняем порядок появления в DOM
+      const domOrder = Array.from(allMessageElements).indexOf(msgEl);
+      
+      messages.push({
+        role: isUser ? 'user' : 'assistant',
+        text: text,
+        html: html,
+        timestampUTC: timestamp ? new Date(timestamp).toISOString() : new Date().toISOString(),
+        domOrder: domOrder // Для сохранения порядка
+      });
+    }
+  }
+  
+  // Если не нашли через role="article", пробуем другие селекторы
+  if (messages.length === 0) {
+    const userMessageSelectors = [
+      '[data-content="user-message"]',
+      '[data-testid*="user-message"]',
+      '.user-message',
+      '[class*="user-message"]'
+    ];
+    
+    const assistantMessageSelectors = [
+      '[data-content="ai-message"]',
+      '[data-testid*="ai-message"]',
+      '.ai-message',
+      '[class*="ai-message"]',
+      '[class*="assistant-message"]'
+    ];
+    
+    // Собираем все элементы и сортируем по позиции в DOM
+    const allElements = [];
+    
+    userMessageSelectors.forEach(selector => {
+      document.querySelectorAll(selector).forEach(el => {
+        allElements.push({ el, role: 'user', selector });
+      });
+    });
+    
+    assistantMessageSelectors.forEach(selector => {
+      document.querySelectorAll(selector).forEach(el => {
+        allElements.push({ el, role: 'assistant', selector });
+      });
+    });
+    
+    // Сортируем по позиции в DOM
+    allElements.sort((a, b) => {
+      const posA = Array.from(document.body.querySelectorAll('*')).indexOf(a.el);
+      const posB = Array.from(document.body.querySelectorAll('*')).indexOf(b.el);
+      return posA - posB;
+    });
+    
+    // Удаляем дубликаты (один элемент может соответствовать нескольким селекторам)
+    const seenElements = new Set();
+    for (const { el, role } of allElements) {
+      if (seenElements.has(el)) continue;
+      seenElements.add(el);
+      
+      const html = cleanMessageHtml(el.innerHTML);
+      const text = el.textContent?.trim() || '';
+      
+      if (text.length > 0) {
+        const timeEl = el.querySelector('time') || 
+                      el.closest('[role="article"]')?.querySelector('time') ||
+                      el.closest('[role="article"]')?.querySelector('[data-testid*="date"]');
+        const timestamp = timeEl ? (timeEl.getAttribute('datetime') || timeEl.textContent) : null;
+        
+        messages.push({
+          role: role,
+          text: text,
+          html: html,
+          timestampUTC: timestamp ? new Date(timestamp).toISOString() : new Date().toISOString(),
+          domOrder: Array.from(document.body.querySelectorAll('*')).indexOf(el)
+        });
+      }
+    }
+  }
+  
+  // Сортируем по порядку в DOM (domOrder), а не по времени
+  messages.sort((a, b) => {
+    if (a.domOrder !== undefined && b.domOrder !== undefined) {
+      return a.domOrder - b.domOrder;
+    }
+    // Fallback: сортировка по времени
+    const timeA = new Date(a.timestampUTC).getTime();
+    const timeB = new Date(b.timestampUTC).getTime();
+    return timeA - timeB;
+  });
+  
+  // Remove duplicates but keep order
+  const uniqueMessages = [];
+  const seenTexts = new Set();
+  for (const msg of messages) {
+    // Use full text for comparison to avoid merging different messages
+    const textKey = msg.text.toLowerCase().trim();
+    if (!seenTexts.has(textKey) && textKey.length > 2) {
+      seenTexts.add(textKey);
+      uniqueMessages.push(msg);
+    }
+  }
+  
+  return uniqueMessages;
+}
+
 // Слушаем сообщения от popup/background
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'getAccountInfo') {
@@ -675,6 +893,47 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       name: null,
       clicked: false,
       error: 'Account button not found'
+    });
+    return true;
+  }
+  
+  if (request.action === 'getChatContentWithHtml') {
+    // Extract chat ID
+    let chatId = request.chatId || null;
+    
+    if (!chatId) {
+      const url = window.location.href;
+      let urlMatch = url.match(/\/chats\/([^\/\?]+)/);
+      if (urlMatch) {
+        chatId = urlMatch[1];
+      } else {
+        const urlParams = new URLSearchParams(window.location.search);
+        chatId = urlParams.get('chatId') || urlParams.get('id') || urlParams.get('conversationId');
+      }
+    }
+    
+    if (!chatId) {
+      sendResponse({
+        success: false,
+        error: 'Chat ID not found in URL'
+      });
+      return true;
+    }
+    
+    // Extract messages with HTML
+    const messages = extractChatMessagesWithHtml();
+    
+    sendResponse({
+      success: true,
+      chatId,
+      messages: messages.map((msg, index) => ({
+        id: `${chatId}_${index}_${Date.now()}`,
+        chatId,
+        role: msg.role,
+        text: msg.text,
+        html: msg.html || null,
+        timestampUTC: msg.timestampUTC
+      }))
     });
     return true;
   }

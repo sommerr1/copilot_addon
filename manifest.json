@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "Copilot Chat Indexer",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "description": "Local indexing and search for Microsoft Copilot chats",
-  "permissions": ["tabs", "webRequest", "storage", "debugger", "windows", "scripting"],
+  "permissions": ["tabs", "webRequest", "storage", "debugger", "windows", "scripting", "downloads"],
   "host_permissions": ["*://copilot.microsoft.com/*"],
   "background": {
     "service_worker": "background.js"

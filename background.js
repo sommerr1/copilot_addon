@@ -1693,8 +1693,18 @@ class SimpleSearchIndex {
 const indexCache = new Map();
 
 async function getOrCreateIndex(accountEmail) {
+  // Check cache first
   if (indexCache.has(accountEmail)) {
-    return indexCache.get(accountEmail);
+    // Verify that account still exists in database
+    // If account was deleted, index should not be in cache
+    const account = await getAccount(accountEmail);
+    if (!account) {
+      // Account was deleted, remove from cache
+      console.log(`getOrCreateIndex: Account ${accountEmail} not found, removing from cache`);
+      indexCache.delete(accountEmail);
+    } else {
+      return indexCache.get(accountEmail);
+    }
   }
   
   const index = new SimpleSearchIndex();
@@ -3028,6 +3038,264 @@ async function startIndexing(accountEmail, incremental = false, resume = false, 
 }
 
 // ========== Export/Import/Reset Functions ==========
+// Maximum message size for Chrome Extension messaging (64MB, but use 50MB for safety)
+const MAX_MESSAGE_SIZE = 50 * 1024 * 1024; // 50MB
+
+// Helper function to estimate JSON size
+function estimateJSONSize(obj) {
+  try {
+    return JSON.stringify(obj).length;
+  } catch (e) {
+    // If stringify fails, return a large number to trigger direct download
+    return MAX_MESSAGE_SIZE + 1;
+  }
+}
+
+// Note: ZIP creation is done in popup.js where JSZip library is available
+// Background script cannot load JSZip due to CSP restrictions in service worker
+
+// Helper function to download file directly using chrome.downloads API
+async function downloadFileDirectly(filename, data) {
+  return new Promise((resolve, reject) => {
+    try {
+      // Sanitize data first with context
+      const sanitizedData = sanitizeForSerialization(data, new WeakSet(), 0, {
+        operation: 'directDownload',
+        filename: filename
+      });
+      const jsonString = JSON.stringify(sanitizedData, null, 2);
+      
+      // Create data URL (base64 encoded)
+      // Note: Data URLs have a size limit (~2MB in some browsers), but for larger files
+      // we'll use a workaround with blob URL in the same context
+      const base64Data = btoa(unescape(encodeURIComponent(jsonString)));
+      const dataUrl = `data:application/json;base64,${base64Data}`;
+      
+      // Check if data URL is too large (some browsers limit data URLs to ~2MB)
+      // For larger files, we need to use a different approach
+      const fileSizeMB = jsonString.length / 1024 / 1024;
+      if (dataUrl.length > 2 * 1024 * 1024) {
+        // For very large files, recommend using by_parts strategy
+        throw new Error(
+          `Файл слишком большой для прямого скачивания (${fileSizeMB.toFixed(2)} MB). ` +
+          `Рекомендуется использовать стратегию "По частям" (by_parts) с большим количеством частей. ` +
+          `Попробуйте экспортировать с ${Math.ceil(fileSizeMB / 2)} частями или больше.`
+        );
+      }
+      
+      // Use chrome.downloads API to download the file
+      chrome.downloads.download({
+        url: dataUrl,
+        filename: filename,
+        saveAs: true
+      }, (downloadId) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else {
+          console.log(`Export: Started download ${filename} with ID ${downloadId}`);
+          resolve(downloadId);
+        }
+      });
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+// Helper function to sanitize data for JSON serialization
+// Removes non-serializable objects (functions, circular references, etc.)
+// context: { chatId, messageId, fieldName } - для детального логирования
+function sanitizeForSerialization(obj, visited = new WeakSet(), depth = 0, context = {}) {
+  // Prevent infinite recursion
+  if (depth > 100) {
+    const contextInfo = context.chatId ? ` (chatId: ${context.chatId}${context.messageId ? `, messageId: ${context.messageId}` : ''})` : '';
+    console.error(`[Serialization] Max depth reached${contextInfo}`);
+    return '[Max Depth Reached]';
+  }
+  
+  // Handle null and undefined
+  if (obj === null || obj === undefined) {
+    return obj;
+  }
+  
+  // Handle primitive types
+  const objType = typeof obj;
+  if (objType !== 'object' && objType !== 'function') {
+    return obj;
+  }
+  
+  // Handle Date objects
+  if (obj instanceof Date) {
+    return obj.toISOString();
+  }
+  
+  // Handle RegExp objects
+  if (obj instanceof RegExp) {
+    return obj.toString();
+  }
+  
+  // Handle Error objects
+  if (obj instanceof Error) {
+    return {
+      name: obj.name,
+      message: obj.message,
+      stack: obj.stack
+    };
+  }
+  
+  // Skip functions
+  if (objType === 'function') {
+    const contextInfo = context.chatId ? ` (chatId: ${context.chatId}${context.messageId ? `, messageId: ${context.messageId}` : ''}${context.fieldName ? `, field: ${context.fieldName}` : ''})` : '';
+    console.warn(`[Serialization] Skipping function${contextInfo}`);
+    return undefined;
+  }
+  
+  // Skip non-serializable objects like Map, Set, WeakMap, WeakSet
+  if (obj instanceof Map || obj instanceof Set || 
+      obj instanceof WeakMap || obj instanceof WeakSet) {
+    const objTypeName = obj.constructor.name;
+    const contextInfo = context.chatId ? ` (chatId: ${context.chatId}${context.messageId ? `, messageId: ${context.messageId}` : ''}${context.fieldName ? `, field: ${context.fieldName}` : ''})` : '';
+    console.warn(`[Serialization] Skipping ${objTypeName}${contextInfo}`);
+    return undefined;
+  }
+  
+  // Handle arrays
+  if (Array.isArray(obj)) {
+    const sanitized = [];
+    const arrayContext = { ...context, isArray: true };
+    
+    for (let i = 0; i < obj.length; i++) {
+      try {
+        const itemContext = { ...arrayContext, arrayIndex: i };
+        const item = sanitizeForSerialization(obj[i], visited, depth + 1, itemContext);
+        if (item !== undefined) {
+          sanitized.push(item);
+        }
+      } catch (e) {
+        const contextInfo = context.chatId ? ` (chatId: ${context.chatId}${context.messageId ? `, messageId: ${context.messageId}` : ''}, array index: ${i})` : ` (array index: ${i})`;
+        console.error(`[Serialization] Failed to sanitize array item${contextInfo}:`, e);
+        console.error(`[Serialization] Item type: ${typeof obj[i]}, constructor: ${obj[i]?.constructor?.name || 'unknown'}`);
+        // Continue with next item
+      }
+    }
+    return sanitized;
+  }
+  
+  // Handle circular references
+  if (visited.has(obj)) {
+    const contextInfo = context.chatId ? ` (chatId: ${context.chatId}${context.messageId ? `, messageId: ${context.messageId}` : ''}${context.fieldName ? `, field: ${context.fieldName}` : ''})` : '';
+    console.warn(`[Serialization] Circular reference detected${contextInfo}`);
+    return '[Circular Reference]';
+  }
+  visited.add(obj);
+  
+  // Handle objects - try to identify if it's a message or chat
+  let objectType = 'object';
+  let objectId = null;
+  if (obj.chatId) {
+    objectType = 'chat';
+    objectId = obj.chatId;
+  } else if (obj.id && (obj.role === 'user' || obj.role === 'assistant')) {
+    objectType = 'message';
+    objectId = obj.id;
+  }
+  
+  const currentContext = {
+    ...context,
+    chatId: objectId && objectType === 'chat' ? objectId : (context.chatId || (obj.chatId ? obj.chatId : null)),
+    messageId: objectId && objectType === 'message' ? objectId : (context.messageId || (obj.id ? obj.id : null)),
+    objectType: objectType
+  };
+  
+  const sanitized = {};
+  const skippedFields = [];
+  const errorFields = [];
+  
+  try {
+    for (const key in obj) {
+      if (obj.hasOwnProperty(key)) {
+        try {
+          const value = obj[key];
+          const fieldContext = { ...currentContext, fieldName: key };
+          
+          // Skip functions
+          if (typeof value === 'function') {
+            skippedFields.push({ field: key, reason: 'function' });
+            continue;
+          }
+          
+          // Check for non-serializable types
+          if (value instanceof Map || value instanceof Set || 
+              value instanceof WeakMap || value instanceof WeakSet) {
+            skippedFields.push({ 
+              field: key, 
+              reason: value.constructor.name,
+              type: typeof value
+            });
+            continue;
+          }
+          
+          // Recursively sanitize value
+          const sanitizedValue = sanitizeForSerialization(value, visited, depth + 1, fieldContext);
+          if (sanitizedValue !== undefined) {
+            sanitized[key] = sanitizedValue;
+          } else {
+            skippedFields.push({ 
+              field: key, 
+              reason: 'returned undefined',
+              valueType: typeof value,
+              valueConstructor: value?.constructor?.name
+            });
+          }
+        } catch (e) {
+          // If serialization fails for a property, skip it
+          errorFields.push({
+            field: key,
+            error: e.message,
+            errorType: e.constructor.name,
+            valueType: typeof obj[key],
+            valueConstructor: obj[key]?.constructor?.name
+          });
+          
+          const contextInfo = currentContext.chatId ? 
+            ` (chatId: ${currentContext.chatId}${currentContext.messageId ? `, messageId: ${currentContext.messageId}` : ''}, field: ${key})` : 
+            ` (field: ${key})`;
+          console.error(`[Serialization] Failed to sanitize property${contextInfo}:`, e);
+          console.error(`[Serialization] Property value type: ${typeof obj[key]}, constructor: ${obj[key]?.constructor?.name || 'unknown'}`);
+          if (obj[key] && typeof obj[key] === 'object') {
+            console.error(`[Serialization] Property value keys:`, Object.keys(obj[key]).slice(0, 10));
+          }
+          continue;
+        }
+      }
+    }
+    
+    // Log summary if there were issues
+    if (skippedFields.length > 0 || errorFields.length > 0) {
+      const contextInfo = currentContext.chatId ? 
+        `chatId: ${currentContext.chatId}${currentContext.messageId ? `, messageId: ${currentContext.messageId}` : ''}` : 
+        'unknown object';
+      
+      if (skippedFields.length > 0) {
+        console.warn(`[Serialization] Skipped ${skippedFields.length} field(s) in ${contextInfo}:`, skippedFields);
+      }
+      if (errorFields.length > 0) {
+        console.error(`[Serialization] Errors in ${errorFields.length} field(s) in ${contextInfo}:`, errorFields);
+      }
+    }
+  } catch (e) {
+    const contextInfo = currentContext.chatId ? 
+      ` (chatId: ${currentContext.chatId}${currentContext.messageId ? `, messageId: ${currentContext.messageId}` : ''})` : '';
+    console.error(`[Serialization] Error during object sanitization${contextInfo}:`, e);
+    console.error(`[Serialization] Object keys:`, Object.keys(obj).slice(0, 20));
+    return { error: 'Failed to sanitize object', context: contextInfo };
+  } finally {
+    visited.delete(obj);
+  }
+  
+  return sanitized;
+}
+
 // Helper function to sanitize account email for filename
 function sanitizeAccountForFilename(accountEmail) {
   if (!accountEmail) {
@@ -3189,6 +3457,9 @@ function splitDataIntoParts(accounts, chats, messages, indexes, partsCount, acco
   const dateStr = getDateStringForFilename();
   const files = [];
   
+  console.log(`splitDataIntoParts: Starting split into ${partsCount} parts`);
+  console.log(`splitDataIntoParts: Total messages: ${messages.length}, chats: ${chats.length}`);
+  
   // Sort messages by timestamp for consistent splitting
   const sortedMessages = [...messages].sort((a, b) => {
     const dateA = new Date(a.timestampUTC || 0);
@@ -3198,6 +3469,7 @@ function splitDataIntoParts(accounts, chats, messages, indexes, partsCount, acco
   
   // Calculate sizes
   const messagesPerPart = Math.ceil(sortedMessages.length / partsCount);
+  console.log(`splitDataIntoParts: Messages per part: ${messagesPerPart}`);
   
   // Create chat ID sets for each part to track which chats belong to which part
   const chatIdsByPart = [];
@@ -3206,6 +3478,8 @@ function splitDataIntoParts(accounts, chats, messages, indexes, partsCount, acco
     const startMsg = i * messagesPerPart;
     const endMsg = Math.min(startMsg + messagesPerPart, sortedMessages.length);
     const partMessages = sortedMessages.slice(startMsg, endMsg);
+    
+    console.log(`splitDataIntoParts: Part ${i + 1}/${partsCount}: messages ${startMsg} to ${endMsg} (${partMessages.length} messages)`);
     
     // Collect chat IDs from messages in this part
     const partChatIds = new Set();
@@ -3224,7 +3498,7 @@ function splitDataIntoParts(accounts, chats, messages, indexes, partsCount, acco
     const partNumber = String(i + 1).padStart(2, '0');
     const filename = `copilot_ind_${sanitizedAccount}_${dateStr}_${partNumber}.json`;
     
-    files.push({
+    const fileData = {
       filename,
       data: {
         accounts,
@@ -3236,9 +3510,13 @@ function splitDataIntoParts(accounts, chats, messages, indexes, partsCount, acco
         partNumber: i + 1,
         totalParts: partsCount
       }
-    });
+    };
+    
+    files.push(fileData);
+    console.log(`splitDataIntoParts: Created part ${i + 1}: ${filename} with ${partMessages.length} messages, ${partChats.length} chats`);
   }
   
+  console.log(`splitDataIntoParts: Created ${files.length} files total`);
   return files;
 }
 
@@ -3722,12 +4000,21 @@ async function resetAccountData(accountEmail) {
     });
   }
   
-  // Delete index
+  // Clear from cache FIRST (before deleting from DB)
+  // This ensures that any subsequent search won't use cached index
+  const wasInCache = indexCache.has(accountEmail);
+  indexCache.delete(accountEmail);
+  console.log(`Reset: Cleared index cache for ${accountEmail} (was in cache: ${wasInCache})`);
+  
+  // Delete index from database
   await new Promise((resolve, reject) => {
     const transaction = db.transaction(['indexes'], 'readwrite');
     const store = transaction.objectStore('indexes');
     const request = store.delete(accountEmail);
-    request.onsuccess = () => resolve();
+    request.onsuccess = () => {
+      console.log(`Reset: Deleted index from database for ${accountEmail}`);
+      resolve();
+    };
     request.onerror = () => reject(request.error);
   });
   
@@ -3736,12 +4023,18 @@ async function resetAccountData(accountEmail) {
     const transaction = db.transaction(['accounts'], 'readwrite');
     const store = transaction.objectStore('accounts');
     const request = store.delete(accountEmail);
-    request.onsuccess = () => resolve();
+    request.onsuccess = () => {
+      console.log(`Reset: Deleted account ${accountEmail} from database`);
+      resolve();
+    };
     request.onerror = () => reject(request.error);
   });
   
-  // Clear from cache
-  indexCache.delete(accountEmail);
+  // Double-check: ensure cache is cleared (in case it was re-added somehow)
+  if (indexCache.has(accountEmail)) {
+    console.warn(`Reset: WARNING! Index still in cache after reset for ${accountEmail}, removing again`);
+    indexCache.delete(accountEmail);
+  }
 }
 
 async function checkHasData() {
@@ -3830,7 +4123,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           if (!email) continue;
           
           try {
+            // Double-check that account still exists (in case it was deleted during search)
+            const accountStillExists = await getAccount(email);
+            if (!accountStillExists) {
+              console.log(`Search: Account ${email} was deleted, skipping search`);
+              // Remove from cache if it exists
+              if (indexCache.has(email)) {
+                indexCache.delete(email);
+              }
+              continue;
+            }
+            
             const index = await getOrCreateIndex(email);
+            
+            // Verify index is not empty (should have documents if account exists)
+            // If index is empty, skip it (account might have been reset)
+            const indexSize = index.documents?.size || 0;
+            if (indexSize === 0) {
+              console.log(`Search: Index for ${email} is empty, skipping search`);
+              continue;
+            }
+            
             const results = index.search(query, { limit: 1000, enrich: true });
             
             // Сохраняем связь между результатами и аккаунтом
@@ -3840,6 +4153,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             }
           } catch (error) {
             console.warn(`Error searching in index for account ${email}:`, error);
+            // Remove from cache on error
+            if (indexCache.has(email)) {
+              indexCache.delete(email);
+            }
           }
         }
         
@@ -3920,19 +4237,564 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     const partsCount = request.partsCount || null;
     
     exportDatabase(strategy, partsCount)
-      .then(data => {
+      .then(async data => {
         if (strategy === 'by_month' || strategy === 'by_parts') {
           console.log(`Export: Created ${data.files?.length || 0} files for strategy ${strategy}`);
           if (data.files && data.files.length > 0) {
             console.log('Export: File names:', data.files.map(f => f.filename).join(', '));
           }
         }
-        sendResponse({ success: true, data, files: data.files });
+        
+        try {
+          console.log('Export: Starting data sanitization...');
+          console.log(`Export: Data contains ${data.accounts?.length || 0} account(s), ${data.chats?.length || 0} chat(s), ${data.messages?.length || 0} message(s)`);
+          
+          // Track problematic chats
+          const problematicChats = new Map();
+          
+          // Try to sanitize with detailed error tracking
+          let sanitizedData;
+          try {
+            sanitizedData = sanitizeForSerialization(data, new WeakSet(), 0, {
+              strategy: strategy,
+              accountCount: data.accounts?.length || 0,
+              chatCount: data.chats?.length || 0,
+              messageCount: data.messages?.length || 0
+            });
+            console.log('Export: Data sanitized successfully');
+          } catch (sanitizeError) {
+            console.error('Export: Sanitization failed:', sanitizeError);
+            console.error('Export: Error stack:', sanitizeError.stack);
+            
+            // Try to identify problematic chats by checking messages
+            if (data.messages && Array.isArray(data.messages)) {
+              console.log(`Export: Checking ${data.messages.length} messages for serialization issues...`);
+              const sampleSize = Math.min(100, data.messages.length);
+              
+              for (let msgIdx = 0; msgIdx < sampleSize; msgIdx++) {
+                const msg = data.messages[msgIdx];
+                try {
+                  JSON.stringify(msg);
+                } catch (msgError) {
+                  const chatId = msg.chatId || 'unknown';
+                  if (!problematicChats.has(chatId)) {
+                    problematicChats.set(chatId, { errors: [], messageCount: 0, chatTitle: null });
+                  }
+                  const chatInfo = problematicChats.get(chatId);
+                  chatInfo.errors.push({
+                    messageId: msg.id,
+                    error: msgError.message,
+                    errorType: msgError.constructor.name,
+                    role: msg.role,
+                    textPreview: msg.text ? msg.text.substring(0, 100) : null
+                  });
+                  chatInfo.messageCount++;
+                  
+                  // Try to get chat title
+                  if (!chatInfo.chatTitle && data.chats) {
+                    const chat = data.chats.find(c => c.chatId === chatId);
+                    if (chat) {
+                      chatInfo.chatTitle = chat.title || chat.url || 'Untitled';
+                    }
+                  }
+                  
+                  console.error(`Export: Problematic message in chat ${chatId} (${chatInfo.chatTitle || 'unknown'}):`, {
+                    messageId: msg.id,
+                    role: msg.role,
+                    error: msgError.message,
+                    textPreview: msg.text ? msg.text.substring(0, 200) : null
+                  });
+                }
+              }
+              
+              // Log summary
+              if (problematicChats.size > 0) {
+                console.error(`Export: Found ${problematicChats.size} problematic chat(s) out of ${sampleSize} checked messages:`);
+                problematicChats.forEach((info, chatId) => {
+                  console.error(`Export:   Chat: ${chatId} (${info.chatTitle || 'unknown'})`);
+                  console.error(`Export:     - ${info.messageCount} problematic message(s)`);
+                  console.error(`Export:     - First error: ${info.errors[0].errorType} - ${info.errors[0].error}`);
+                  if (info.errors[0].textPreview) {
+                    console.error(`Export:     - Message preview: ${info.errors[0].textPreview}`);
+                  }
+                });
+              }
+            }
+            
+            // Create detailed error message
+            let errorMessage = `Serialization error: ${sanitizeError.message}`;
+            if (problematicChats.size > 0) {
+              errorMessage += `\n\nПроблемные чаты (${problematicChats.size}):\n`;
+              problematicChats.forEach((info, chatId) => {
+                errorMessage += `  - ${info.chatTitle || chatId}: ${info.messageCount} сообщение(й) с ошибками\n`;
+                errorMessage += `    Причина: ${info.errors[0].errorType} - ${info.errors[0].error}\n`;
+              });
+            }
+            
+            throw new Error(errorMessage);
+          }
+          
+          // Check if data is too large for messaging
+          const dataSize = estimateJSONSize(sanitizedData);
+          console.log(`Export: Estimated data size: ${(dataSize / 1024 / 1024).toFixed(2)} MB`);
+          
+          if (strategy === 'single') {
+            // For single file, check if we need direct download
+            if (dataSize > MAX_MESSAGE_SIZE) {
+              console.log('Export: Data too large, using direct download...');
+              const sanitizedAccount = sanitizeAccountForFilename(data.accounts?.[0]?.email || 'unknown');
+              const dateStr = getDateStringForFilename();
+              const filename = `copilot_ind_${sanitizedAccount}_${dateStr}.json`;
+              
+              try {
+                await downloadFileDirectly(filename, sanitizedData);
+                sendResponse({ 
+                  success: true, 
+                  directDownload: true,
+                  filename: filename
+                });
+              } catch (downloadError) {
+                console.error('Export: Direct download error:', downloadError);
+                sendResponse({ 
+                  success: false, 
+                  error: `Download error: ${downloadError.message}` 
+                });
+              }
+              return;
+            }
+            
+            // Small enough to send via message
+            sendResponse({ 
+              success: true, 
+              data: sanitizedData
+            });
+            return;
+          }
+          
+          // For multiple files (by_month or by_parts)
+          if (data.files && Array.isArray(data.files)) {
+            console.log(`Export: Processing ${data.files.length} files...`);
+            console.log(`Export: File names from exportDatabase:`, data.files.map(f => f.filename));
+            const sanitizedFiles = [];
+            const filesToDownload = [];
+            const problematicChats = new Map(); // Map<chatId, {errors: [], messages: []}>
+            
+            for (let i = 0; i < data.files.length; i++) {
+              try {
+                const file = data.files[i];
+                console.log(`Export: Processing file ${i + 1}/${data.files.length}: ${file.filename}`);
+                
+                // Collect chat IDs from this file for context
+                const chatIdsInFile = new Set();
+                if (file.data?.chats) {
+                  file.data.chats.forEach(chat => {
+                    if (chat.chatId) chatIdsInFile.add(chat.chatId);
+                  });
+                }
+                if (file.data?.messages) {
+                  file.data.messages.forEach(msg => {
+                    if (msg.chatId) chatIdsInFile.add(msg.chatId);
+                  });
+                }
+                
+                console.log(`Export: File ${i + 1} contains ${chatIdsInFile.size} unique chat(s), ${file.data?.messages?.length || 0} message(s)`);
+                
+                // Try to sanitize with detailed error tracking
+                let sanitizedFileData;
+                try {
+                  sanitizedFileData = sanitizeForSerialization(file.data, new WeakSet(), 0, {
+                    fileIndex: i,
+                    filename: file.filename,
+                    chatCount: chatIdsInFile.size
+                  });
+                } catch (sanitizeError) {
+                  console.error(`Export: Sanitization failed for file ${i + 1} (${file.filename}):`, sanitizeError);
+                  console.error(`Export: File contains ${file.data?.chats?.length || 0} chats, ${file.data?.messages?.length || 0} messages`);
+                  
+                  // Try to identify problematic chats
+                  if (file.data?.messages) {
+                    console.log(`Export: Checking messages for serialization issues...`);
+                    for (let msgIdx = 0; msgIdx < Math.min(10, file.data.messages.length); msgIdx++) {
+                      const msg = file.data.messages[msgIdx];
+                      try {
+                        JSON.stringify(msg);
+                      } catch (msgError) {
+                        const chatId = msg.chatId || 'unknown';
+                        if (!problematicChats.has(chatId)) {
+                          problematicChats.set(chatId, { errors: [], messages: [] });
+                        }
+                        problematicChats.get(chatId).errors.push({
+                          messageId: msg.id,
+                          error: msgError.message,
+                          errorType: msgError.constructor.name
+                        });
+                        problematicChats.get(chatId).messages.push({
+                          id: msg.id,
+                          role: msg.role,
+                          textLength: msg.text?.length || 0
+                        });
+                        console.error(`Export: Problematic message in chat ${chatId}, messageId: ${msg.id}:`, msgError);
+                      }
+                    }
+                  }
+                  
+                  throw sanitizeError;
+                }
+                
+                const fileSize = estimateJSONSize(sanitizedFileData);
+                
+                if (fileSize > MAX_MESSAGE_SIZE) {
+                  console.log(`Export: File ${i + 1} (${file.filename}) too large (${(fileSize / 1024 / 1024).toFixed(2)} MB), will download directly`);
+                  filesToDownload.push({
+                    index: i,
+                    filename: file.filename,
+                    data: sanitizedFileData
+                  });
+                } else {
+                  sanitizedFiles.push({
+                    filename: file.filename,
+                    data: sanitizedFileData
+                  });
+                }
+                
+                if ((i + 1) % 5 === 0) {
+                  console.log(`Export: Processed ${i + 1}/${data.files.length} files...`);
+                }
+              } catch (fileError) {
+                console.error(`Export: Error processing file ${i + 1} (${data.files[i]?.filename}):`, fileError);
+                console.error(`Export: Error stack:`, fileError.stack);
+                
+                // Log problematic chats if found
+                if (problematicChats.size > 0) {
+                  console.error(`Export: Found ${problematicChats.size} problematic chat(s):`);
+                  problematicChats.forEach((info, chatId) => {
+                    console.error(`Export: Chat ${chatId}: ${info.errors.length} error(s), ${info.messages.length} message(s) affected`);
+                    info.errors.forEach(err => {
+                      console.error(`Export:   - Message ${err.messageId}: ${err.errorType} - ${err.error}`);
+                    });
+                  });
+                }
+                
+                // Skip this file but continue with others
+              }
+            }
+            
+            // Log summary of problematic chats
+            if (problematicChats.size > 0) {
+              console.error(`Export: Summary - ${problematicChats.size} chat(s) have serialization issues:`);
+              problematicChats.forEach((info, chatId) => {
+                console.error(`Export:   Chat ${chatId}: ${info.errors.length} message(s) with errors`);
+              });
+            }
+            
+            // Combine all files (both small and large)
+            const allFiles = [
+              ...sanitizedFiles,
+              ...filesToDownload.map(f => ({
+                filename: f.filename,
+                data: f.data
+              }))
+            ];
+            
+            console.log(`Export: Combined files - sanitized: ${sanitizedFiles.length}, toDownload: ${filesToDownload.length}, total: ${allFiles.length}`);
+            console.log(`Export: All file names:`, allFiles.map(f => f.filename));
+            
+            // Calculate total size
+            let totalSize = 0;
+            for (const file of allFiles) {
+              totalSize += estimateJSONSize(file);
+            }
+            
+            const totalSizeMB = totalSize / 1024 / 1024;
+            console.log(`Export: Total size of ${allFiles.length} files: ${totalSizeMB.toFixed(2)} MB`);
+            
+            // Log each file's size
+            allFiles.forEach((file, idx) => {
+              const fileSize = estimateJSONSize(file);
+              const fileSizeMB = fileSize / 1024 / 1024;
+              console.log(`Export: File ${idx + 1}: ${file.filename} - ${fileSizeMB.toFixed(2)} MB, ${file.data?.messages?.length || 0} messages, part ${file.data?.partNumber || 'N/A'}/${file.data?.totalParts || 'N/A'}`);
+            });
+            
+            // If total size exceeds limit, we need to split or use alternative approach
+            // Since ZIP creation in background script has issues, we'll send files to popup.js
+            // where JSZip already works, or split into smaller chunks
+            if (totalSize > MAX_MESSAGE_SIZE) {
+              console.log(`Export: Total size (${totalSizeMB.toFixed(2)} MB) exceeds message limit`);
+              
+              // Strategy: Send files in chunks that fit within message limit
+              // Each chunk will be processed separately in popup.js
+              const chunks = [];
+              let currentChunk = [];
+              let currentChunkSize = 0;
+              
+              for (const file of allFiles) {
+                const fileSize = estimateJSONSize(file);
+                
+                // If single file is too large, we can't send it
+                if (fileSize > MAX_MESSAGE_SIZE) {
+                  console.warn(`Export: File ${file.filename} (${(fileSize / 1024 / 1024).toFixed(2)} MB) is too large to send`);
+                  // Try to download it directly (may be blocked by browser)
+                  try {
+                    await downloadFileDirectly(file.filename, file.data);
+                    console.log(`Export: Downloaded large file ${file.filename} directly`);
+                  } catch (downloadError) {
+                    console.error(`Export: Failed to download ${file.filename}:`, downloadError);
+                  }
+                  continue;
+                }
+                
+                // Check if adding this file would exceed chunk limit
+                if (currentChunkSize + fileSize > MAX_MESSAGE_SIZE && currentChunk.length > 0) {
+                  chunks.push(currentChunk);
+                  currentChunk = [];
+                  currentChunkSize = 0;
+                }
+                
+                currentChunk.push(file);
+                currentChunkSize += fileSize;
+              }
+              
+              // Add remaining chunk
+              if (currentChunk.length > 0) {
+                chunks.push(currentChunk);
+              }
+              
+              console.log(`Export: Split ${allFiles.length} files into ${chunks.length} chunk(s) for transmission`);
+              
+              // If we have multiple chunks, we need to send them all
+              // Flatten all chunks into a single array of files
+              const allFilesFromChunks = chunks.flat();
+              console.log(`Export: Flattened ${chunks.length} chunks into ${allFilesFromChunks.length} files`);
+              
+              // Check if all files from chunks fit in one message
+              let chunkTotalSize = 0;
+              for (const file of allFilesFromChunks) {
+                chunkTotalSize += estimateJSONSize(file);
+              }
+              const chunkTotalSizeMB = chunkTotalSize / 1024 / 1024;
+              
+              if (chunkTotalSize <= MAX_MESSAGE_SIZE) {
+                // All files fit - send them all
+                console.log(`Export: All ${allFilesFromChunks.length} files fit in message (${chunkTotalSizeMB.toFixed(2)} MB), sending all...`);
+                sendResponse({ 
+                  success: true, 
+                  files: allFilesFromChunks,
+                  directDownloadCount: 0,
+                  needsZipCreation: true,
+                  message: `Отправлено ${allFilesFromChunks.length} файл(ов) для создания ZIP архива`
+                });
+              } else {
+                // Files don't fit - send first chunk and indicate more chunks needed
+                console.warn(`Export: Files don't fit in one message (${chunkTotalSizeMB.toFixed(2)} MB), sending first chunk only`);
+                sendResponse({ 
+                  success: true, 
+                  files: chunks[0] || [],
+                  directDownloadCount: 0,
+                  totalChunks: chunks.length,
+                  currentChunk: 0,
+                  totalFiles: allFilesFromChunks.length,
+                  needsZipCreation: true,
+                  message: `Файлы слишком большие. Отправлена первая часть (${chunks[0]?.length || 0} из ${allFilesFromChunks.length} файлов). Попробуйте использовать больше частей при экспорте.`
+                });
+              }
+            } else if (allFiles.length > 1 || filesToDownload.length > 0) {
+              // Multiple files but total size is OK - send ALL files to popup.js for ZIP creation
+              console.log(`Export: Sending ${allFiles.length} files to popup.js for ZIP creation (total size: ${totalSizeMB.toFixed(2)} MB)...`);
+              console.log(`Export: Files breakdown - sanitized: ${sanitizedFiles.length}, to download: ${filesToDownload.length}, total: ${allFiles.length}`);
+              sendResponse({ 
+                success: true, 
+                files: allFiles, // Send ALL files (both sanitized and those marked for download)
+                directDownloadCount: 0, // All files will be in ZIP, no direct downloads needed
+                needsZipCreation: true, // Signal popup.js to create ZIP
+                message: `Отправлено ${allFiles.length} файл(ов) для создания ZIP архива`
+              });
+            } else {
+              // Single small file - send via message
+              console.log(`Export: Sending response with ${sanitizedFiles.length} files via message (total size: ${totalSizeMB.toFixed(2)} MB)...`);
+              sendResponse({ 
+                success: true, 
+                files: sanitizedFiles,
+                directDownloadCount: 0
+              });
+            }
+          } else {
+            sendResponse({ 
+              success: true, 
+              files: []
+            });
+          }
+        } catch (serializationError) {
+          console.error('Export: Serialization error:', serializationError);
+          console.error('Export: Error stack:', serializationError.stack);
+          
+          // Extract detailed error information
+          let errorMessage = serializationError.message || 'Unknown serialization error';
+          let errorDetails = '';
+          
+          // Check if error message contains chat information
+          if (serializationError.message && serializationError.message.includes('Проблемные чаты')) {
+            errorDetails = serializationError.message;
+          } else {
+            // Try to provide more context
+            errorDetails = `Ошибка сериализации: ${errorMessage}`;
+            if (data?.chats?.length) {
+              errorDetails += `\nВсего чатов: ${data.chats.length}`;
+            }
+            if (data?.messages?.length) {
+              errorDetails += `\nВсего сообщений: ${data.messages.length}`;
+            }
+          }
+          
+          sendResponse({ 
+            success: false, 
+            error: errorDetails,
+            errorType: 'serialization',
+            chatCount: data?.chats?.length || 0,
+            messageCount: data?.messages?.length || 0
+          });
+        }
       })
       .catch(error => {
         console.error('Export error:', error);
-        sendResponse({ success: false, error: error.message });
+        console.error('Export error stack:', error.stack);
+        sendResponse({ 
+          success: false, 
+          error: error.message || 'Unknown export error',
+          errorType: 'export'
+        });
       });
+    
+    return true;
+  }
+  
+  if (request.type === 'EXPORT_MD') {
+    (async () => {
+      try {
+        const { chatIds, accountEmail } = request;
+        
+        if (!chatIds || !Array.isArray(chatIds) || chatIds.length === 0) {
+          sendResponse({ success: false, error: 'No chat IDs provided' });
+          return;
+        }
+        
+        if (!accountEmail) {
+          sendResponse({ success: false, error: 'Account email not provided' });
+          return;
+        }
+        
+        // Get chats data from DB (only for URLs and titles)
+        const chatsData = [];
+        for (const chatId of chatIds) {
+          try {
+            const chat = await getChat(chatId);
+            if (!chat) {
+              console.warn(`Chat ${chatId} not found, skipping`);
+              continue;
+            }
+            chatsData.push({ chatId, chat });
+          } catch (error) {
+            console.error(`Error getting chat ${chatId}:`, error);
+          }
+        }
+        
+        // Open each chat in a new tab and extract HTML directly
+        const exportData = [];
+        
+        for (const { chatId, chat } of chatsData) {
+          let tab = null;
+          try {
+            console.log(`Export MD: Opening chat ${chatId} in new tab...`);
+            
+            // Open chat in new tab
+            tab = await chrome.tabs.create({
+              url: chat.url || `https://copilot.microsoft.com/chats/${chatId}`,
+              active: false // Open in background
+            });
+            
+            // Wait for page to load
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Wait for content to be ready
+            let loadRetries = 10;
+            while (loadRetries > 0) {
+              try {
+                const tabInfo = await chrome.tabs.get(tab.id);
+                if (tabInfo.status === 'complete') {
+                  // Wait a bit more for content to render
+                  await new Promise(resolve => setTimeout(resolve, 2000));
+                  break;
+                }
+                await new Promise(resolve => setTimeout(resolve, 500));
+              } catch (e) {
+                throw new Error('Tab was closed during loading');
+              }
+              loadRetries--;
+            }
+            
+            // Request HTML content from content script
+            let response = null;
+            let retries = 5;
+            while (retries > 0) {
+              try {
+                response = await chrome.tabs.sendMessage(tab.id, {
+                  action: 'getChatContentWithHtml',
+                  chatId: chatId
+                });
+                if (response && response.success) {
+                  break;
+                }
+              } catch (e) {
+                // Content script might not be ready yet
+                await new Promise(resolve => setTimeout(resolve, 1000));
+              }
+              retries--;
+            }
+            
+            if (response && response.success && response.messages) {
+              exportData.push({
+                chatId: chatId,
+                chat: chat,
+                messages: response.messages
+              });
+              console.log(`Export MD: Successfully extracted ${response.messages.length} messages from chat ${chatId}`);
+            } else {
+              console.warn(`Export MD: Failed to extract messages from chat ${chatId}`);
+              // Still add chat with empty messages
+              exportData.push({
+                chatId: chatId,
+                chat: chat,
+                messages: []
+              });
+            }
+          } catch (error) {
+            console.error(`Export MD: Error processing chat ${chatId}:`, error);
+            // Still add chat even if extraction failed
+            exportData.push({
+              chatId: chatId,
+              chat: chat,
+              messages: []
+            });
+          } finally {
+            // Close the tab
+            if (tab && tab.id) {
+              try {
+                await chrome.tabs.remove(tab.id);
+              } catch (e) {
+                console.warn(`Export MD: Failed to close tab ${tab.id}:`, e);
+              }
+            }
+          }
+        }
+        
+        sendResponse({
+          success: true,
+          data: exportData
+        });
+      } catch (error) {
+        console.error('Export MD error:', error);
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
     
     return true;
   }
@@ -4032,12 +4894,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           request.onerror = () => reject(request.error);
         });
         
-        // Для каждого аккаунта получаем количество чатов
+        // Для каждого аккаунта получаем количество индексированных чатов
         const accountsWithChats = await Promise.all(accounts.map(async (account) => {
           const chats = await getChatsByAccount(account.email);
+          // Считаем только индексированные чаты (те, у которых есть lastIndexedUTC)
+          const indexedChats = chats.filter(chat => chat.lastIndexedUTC !== null && chat.lastIndexedUTC !== undefined);
           return {
             email: account.email,
-            chatCount: chats.length,
+            chatCount: indexedChats.length,
             lastIndexedUTC: account.lastIndexedUTC
           };
         }));

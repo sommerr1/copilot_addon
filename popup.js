@@ -52,6 +52,7 @@ const indexControlBtn = document.getElementById('indexControlBtn');
 const indexingInfo = document.getElementById('indexingInfo');
 const resumeIndexBtn = document.getElementById('resumeIndexBtn');
 const exportBtn = document.getElementById('exportBtn');
+const exportMdBtn = document.getElementById('exportMdBtn');
 const importBtn = document.getElementById('importBtn');
 const importFile = document.getElementById('importFile');
 const resetBtn = document.getElementById('resetBtn');
@@ -418,6 +419,9 @@ async function init() {
   // Initialize chat selection
   setupChatSelection();
   
+  // Initialize reset buttons (multiple if multiple accounts)
+  await initializeResetButtons();
+  
   const hasDataResult = await hasData();
   if (hasDataResult) {
     switchTab('search');
@@ -455,7 +459,7 @@ function setupChatSelection() {
       
       // Update month checkboxes if date sorting is active
       const sortValue = sortBy.value;
-      if (sortValue === 'date-desc' || sortValue === 'date-asc') {
+      if (chatsList && (sortValue === 'date-desc' || sortValue === 'date-asc')) {
         const monthCheckboxes = chatsList.querySelectorAll('.month-checkbox');
         monthCheckboxes.forEach(monthCheckbox => {
           monthCheckbox.checked = checked;
@@ -485,6 +489,7 @@ function setupChatSelection() {
 // Load chats for selection
 async function loadChatsForSelection() {
   if (!currentAccountEmail) return;
+  if (!chatsList) return;
   
   chatsList.innerHTML = '<div class="loading-chats">Загрузка чатов...</div>';
   
@@ -500,10 +505,14 @@ async function loadChatsForSelection() {
       renderChatsList();
       updateIndexingStats();
     } else {
-      chatsList.innerHTML = '<div class="empty-chats">Ошибка загрузки чатов</div>';
+      if (chatsList) {
+        chatsList.innerHTML = '<div class="empty-chats">Ошибка загрузки чатов</div>';
+      }
     }
   } catch (error) {
-    chatsList.innerHTML = `<div class="empty-chats">Ошибка: ${error.message}</div>`;
+    if (chatsList) {
+      chatsList.innerHTML = `<div class="empty-chats">Ошибка: ${error.message}</div>`;
+    }
   }
 }
 
@@ -548,7 +557,9 @@ function formatMonthName(dateString) {
 
 // Render chats list
 function renderChatsList() {
-  if (!chatsList || chatsData.length === 0) {
+  if (!chatsList) return;
+  
+  if (chatsData.length === 0) {
     chatsList.innerHTML = '<div class="empty-chats">Нет чатов для индексации</div>';
     return;
   }
@@ -1384,6 +1395,12 @@ if (exportOptionsConfirm) {
         const dateStr = now.toISOString().split('T')[0];
         
         if (selectedStrategy === 'single') {
+          // Check if file was downloaded directly (too large for messaging)
+          if (response.directDownload) {
+            setStatus(`Файл ${response.filename} скачан напрямую (слишком большой для передачи)`);
+            return;
+          }
+          
           // Single file export - original behavior
           const dataStr = JSON.stringify(response.data, null, 2);
           const blob = new Blob([dataStr], { type: 'application/json' });
@@ -1397,11 +1414,44 @@ if (exportOptionsConfirm) {
           URL.revokeObjectURL(url);
           setStatus('База данных экспортирована');
         } else if (selectedStrategy === 'by_month' || selectedStrategy === 'by_parts') {
-          // Multiple files export - create ZIP archive
+          // Check if ZIP was already created in background script
+          if (response.zipDownloaded) {
+            console.log(`Export: ZIP archive already created: ${response.zipFilename}`);
+            setStatus(response.reason || `ZIP архив ${response.zipFilename} успешно создан и скачан`);
+            return;
+          }
+          
+          // Check if some files were downloaded directly
+          if (response.directDownloadCount > 0) {
+            console.log(`Export: ${response.directDownloadCount} file(s) were downloaded directly`);
+            setStatus(`Экспорт: ${response.directDownloadCount} файл(ов) скачан(ы) напрямую (слишком большие)`);
+          }
+          
+          // Multiple files export - create ZIP archive in popup.js (JSZip works here)
           const files = response.files || [];
+          const directDownloadCount = response.directDownloadCount || 0;
+          const needsZipCreation = response.needsZipCreation || false;
           console.log(`Export: Received response with files array:`, response);
-          console.log(`Export: Received ${files.length} files to archive`);
+          console.log(`Export: Received ${files.length} files to archive, ${directDownloadCount} downloaded directly, needsZipCreation: ${needsZipCreation}`);
           console.log(`Export: File names:`, files.map(f => f.filename));
+          
+          // If all files were downloaded directly and no ZIP needed, just show status
+          if (files.length === 0 && directDownloadCount > 0 && !needsZipCreation) {
+            setStatus(`Все ${directDownloadCount} файл(ов) скачан(ы) напрямую (слишком большие для передачи)`);
+            return;
+          }
+          
+          // If no files and ZIP error, show error
+          if (files.length === 0 && response.zipError) {
+            setStatus(`Ошибка создания ZIP: ${response.zipError}`, true);
+            return;
+          }
+          
+          // If needsZipCreation but no files, it means files were too large to send
+          if (files.length === 0 && needsZipCreation) {
+            setStatus(`Файлы слишком большие для передачи. Попробуйте использовать больше частей при экспорте.`, true);
+            return;
+          }
           
           // Debug: Check file contents
           if (files.length > 0) {
@@ -1416,17 +1466,35 @@ if (exportOptionsConfirm) {
             return;
           }
           
-          setStatus(`Создание архива из ${files.length} файл(ов)...`);
+          // Always create ZIP if multiple files or needsZipCreation flag is set
+          if (needsZipCreation || files.length > 1) {
+            setStatus(`Создание ZIP архива из ${files.length} файл(ов)...`);
+          } else {
+            setStatus(`Создание архива из ${files.length} файл(ов)...`);
+          }
           
           // Log to console for debugging (open popup console with right-click -> Inspect)
           console.log('=== EXPORT DEBUG INFO ===');
           console.log('Files received:', files.length);
+          console.log('Response object:', response);
           console.log('File details:', files.map(f => ({
             filename: f.filename,
             messages: f.data?.messages?.length || 0,
-            chats: f.data?.chats?.length || 0
+            chats: f.data?.chats?.length || 0,
+            partNumber: f.data?.partNumber,
+            totalParts: f.data?.totalParts
           })));
+          console.log('File names:', files.map(f => f.filename));
           console.log('=======================');
+          
+          // Verify we have all expected parts
+          if (files.length > 0 && files[0].data?.totalParts) {
+            const expectedParts = files[0].data.totalParts;
+            if (files.length !== expectedParts) {
+              console.warn(`Export: WARNING! Expected ${expectedParts} parts, but received ${files.length} files!`);
+              setStatus(`Предупреждение: Ожидалось ${expectedParts} частей, получено ${files.length}`, true);
+            }
+          }
           
           try {
             // Load JSZip library
@@ -1499,14 +1567,37 @@ if (exportOptionsConfirm) {
             URL.revokeObjectURL(url);
             
             console.log(`Export: Successfully created and downloaded ZIP archive: ${zipFilename}`);
-            setStatus(`Экспортировано ${files.length} файл(ов) в архив ${zipFilename}`);
+            let statusMsg = `Экспортировано ${files.length} файл(ов) в архив ${zipFilename}`;
+            if (directDownloadCount > 0) {
+              statusMsg += ` (+ ${directDownloadCount} файл(ов) скачан(ы) отдельно)`;
+            }
+            setStatus(statusMsg);
           } catch (error) {
             console.error('Export: Error creating ZIP archive:', error);
             setStatus(`Ошибка создания архива: ${error.message}`, true);
           }
         }
       } else {
-        setStatus(`Ошибка экспорта: ${response?.error || 'Неизвестная ошибка'}`, true);
+        // Show detailed error information
+        let errorMsg = response?.error || 'Неизвестная ошибка';
+        
+        // If it's a serialization error, show additional details
+        if (response?.errorType === 'serialization') {
+          errorMsg = `Ошибка сериализации данных:\n${errorMsg}`;
+          if (response.chatCount || response.messageCount) {
+            errorMsg += `\n\nСтатистика:\n`;
+            if (response.chatCount) {
+              errorMsg += `- Чатов: ${response.chatCount}\n`;
+            }
+            if (response.messageCount) {
+              errorMsg += `- Сообщений: ${response.messageCount}`;
+            }
+          }
+          errorMsg += `\n\nПроверьте консоль браузера (F12) для детальной информации о проблемных чатах.`;
+        }
+        
+        setStatus(errorMsg, true);
+        console.error('Export error details:', response);
       }
     } catch (error) {
       console.error('Export error:', error);
@@ -1520,6 +1611,355 @@ if (exportOptionsDialog) {
   exportOptionsDialog.addEventListener('click', (e) => {
     if (e.target === exportOptionsDialog) {
       hideExportOptionsDialog();
+    }
+  });
+}
+
+// Export to Markdown
+if (exportMdBtn) {
+  exportMdBtn.addEventListener('click', async () => {
+    if (!currentAccountEmail) {
+      setStatus('Ошибка: Аккаунт не определен', true);
+      return;
+    }
+
+    try {
+      setStatus('Подготовка экспорта в MD...');
+      
+      // Get selected chats or all chats
+      const selectedChats = Array.from(selectedChatIds);
+      if (selectedChats.length === 0) {
+        // If no chats selected, ask user
+        const allChats = chatsData.map(c => c.chatId);
+        if (allChats.length === 0) {
+          setStatus('Ошибка: Нет чатов для экспорта', true);
+          return;
+        }
+        
+        // Ask user if they want to export all chats
+        const exportAll = confirm(`Экспортировать все ${allChats.length} чат(ов) в MD?`);
+        if (!exportAll) {
+          setStatus('Экспорт отменен');
+          return;
+        }
+        
+        selectedChats.push(...allChats);
+      }
+
+      setStatus(`Экспорт ${selectedChats.length} чат(ов) в MD...`);
+      
+      const response = await chrome.runtime.sendMessage({
+        type: 'EXPORT_MD',
+        chatIds: selectedChats,
+        accountEmail: currentAccountEmail
+      });
+
+      if (response && response.success && response.data) {
+        // Load export-md module
+        const { exportChatsToMarkdown, convertHtmlToMarkdown, formatMessageForMarkdown } = 
+          await import(chrome.runtime.getURL('storage/export-md.js'));
+        
+        // Convert data to markdown
+        const files = [];
+        for (const chatData of response.data) {
+          try {
+            const chat = chatData.chat;
+            const messages = chatData.messages || [];
+            
+            if (messages.length === 0) {
+              continue;
+            }
+            
+            // Build markdown content with chat-like formatting
+            let markdown = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+body {
+  background-color: #ffffff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 20px;
+  line-height: 1.6;
+  color: #333;
+}
+.chat-header {
+  border-bottom: 1px solid #e0e0e0;
+  padding-bottom: 10px;
+  margin-bottom: 20px;
+}
+.message {
+  margin: 16px 0;
+  display: flex;
+  flex-direction: column;
+}
+.message-header {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: #666;
+}
+.message-user .message-bubble {
+  background-color: #f28b82;
+  color: #000;
+  border-radius: 18px;
+  padding: 12px 16px;
+  max-width: 85%;
+  align-self: flex-start;
+  word-wrap: break-word;
+}
+.message-assistant .message-bubble {
+  background-color: #f1f3f4;
+  color: #000;
+  border-radius: 18px;
+  padding: 12px 16px;
+  max-width: 85%;
+  align-self: flex-start;
+  word-wrap: break-word;
+}
+.message-bubble p {
+  margin: 0 0 12px 0;
+  line-height: 1.6;
+}
+.message-bubble p:last-child {
+  margin-bottom: 0;
+}
+.message-bubble h1, .message-bubble h2, .message-bubble h3, 
+.message-bubble h4, .message-bubble h5, .message-bubble h6 {
+  margin: 16px 0 8px 0;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.message-bubble h1 { font-size: 1.5em; }
+.message-bubble h2 { font-size: 1.3em; }
+.message-bubble h3 { font-size: 1.1em; }
+.message-bubble code {
+  background-color: rgba(0,0,0,0.1);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: "Courier New", "Consolas", monospace;
+  font-size: 0.9em;
+}
+.message-bubble pre {
+  background-color: rgba(0,0,0,0.05);
+  padding: 12px 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 12px 0;
+  border: 1px solid rgba(0,0,0,0.1);
+}
+.message-bubble pre code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+}
+.message-bubble ul, .message-bubble ol {
+  margin: 12px 0;
+  padding-left: 24px;
+}
+.message-bubble li {
+  margin: 6px 0;
+  line-height: 1.5;
+}
+.message-bubble a {
+  color: #1a73e8;
+  text-decoration: none;
+}
+.message-bubble a:hover {
+  text-decoration: underline;
+}
+.message-bubble strong {
+  font-weight: 600;
+}
+.message-bubble em {
+  font-style: italic;
+}
+.separator {
+  height: 1px;
+  background-color: #e0e0e0;
+  margin: 20px 0;
+}
+</style>
+</head>
+<body>
+<div class="chat-header">
+<h1>${chat.title || 'Безымянный чат'}</h1>`;
+
+            if (chat.url) {
+              markdown += `<p><strong>Ссылка:</strong> <a href="${chat.url}">${chat.url}</a></p>`;
+            }
+            
+            if (chat.updatedAtUTC) {
+              const date = new Date(chat.updatedAtUTC).toLocaleString('ru-RU');
+              markdown += `<p><strong>Дата обновления:</strong> ${date}</p>`;
+            }
+            
+            markdown += `</div>
+<div class="separator"></div>
+`;
+            
+            // Объединяем последовательные сообщения одного типа
+            const mergedMessages = [];
+            let currentGroup = null;
+            
+            for (const message of messages) {
+              const role = message.role || 'user';
+              
+              if (!currentGroup || currentGroup.role !== role) {
+                // Начинаем новую группу
+                if (currentGroup) {
+                  mergedMessages.push(currentGroup);
+                }
+                currentGroup = {
+                  role: role,
+                  messages: [message],
+                  timestampUTC: message.timestampUTC
+                };
+              } else {
+                // Добавляем к текущей группе
+                currentGroup.messages.push(message);
+              }
+            }
+            
+            // Добавляем последнюю группу
+            if (currentGroup) {
+              mergedMessages.push(currentGroup);
+            }
+            
+            // Export merged messages
+            for (const group of mergedMessages) {
+              const role = group.role;
+              const timestamp = group.timestampUTC ? new Date(group.timestampUTC).toLocaleString('ru-RU') : '';
+              
+              // Объединяем все сообщения группы
+              let combinedHtml = '';
+              let combinedText = '';
+              
+              for (let i = 0; i < group.messages.length; i++) {
+                const message = group.messages[i];
+                if (message.html && message.html.trim()) {
+                  // Если есть HTML, используем его
+                  if (combinedHtml) {
+                    combinedHtml += ' ';
+                  }
+                  combinedHtml += message.html;
+                } else if (message.text) {
+                  // Если нет HTML, используем текст
+                  if (combinedText) {
+                    combinedText += ' ';
+                  }
+                  combinedText += message.text;
+                }
+              }
+              
+              // Используем HTML напрямую, если есть, иначе текст как параграф
+              let htmlContent = '';
+              if (combinedHtml.trim()) {
+                // Используем HTML напрямую, только очистим от лишних пробелов
+                htmlContent = combinedHtml.trim();
+              } else if (combinedText.trim()) {
+                // Если только текст, оборачиваем в параграфы
+                const paragraphs = combinedText.trim().split(/\n\n+/).filter(p => p.trim());
+                htmlContent = paragraphs.map(p => `<p>${p.trim()}</p>`).join('\n');
+              }
+              
+              if (role === 'user') {
+                markdown += `<div class="message message-user">
+  <div class="message-header">👤 Пользователь${timestamp ? ` • ${timestamp}` : ''}</div>
+  <div class="message-bubble">${htmlContent}</div>
+</div>
+`;
+              } else if (role === 'assistant') {
+                markdown += `<div class="message message-assistant">
+  <div class="message-header">🤖 Copilot${timestamp ? ` • ${timestamp}` : ''}</div>
+  <div class="message-bubble">${htmlContent}</div>
+</div>
+`;
+              } else {
+                markdown += `<div class="message">
+  <div class="message-header">${role}${timestamp ? ` • ${timestamp}` : ''}</div>
+  <div class="message-bubble">${htmlContent}</div>
+</div>
+`;
+              }
+            }
+            
+            markdown += `</body>
+</html>`;
+            
+            // Create filename
+            const title = chat.title || 'Безымянный чат';
+            const sanitizedTitle = title
+              .replace(/[<>:"/\\|?*]/g, '_')
+              .replace(/\s+/g, '_')
+              .substring(0, 100);
+            const filename = `${sanitizedTitle}_${chat.chatId.substring(0, 8)}.html`;
+            
+            files.push({
+              chatId: chat.chatId,
+              filename: filename,
+              content: markdown,
+              title: chat.title
+            });
+          } catch (error) {
+            console.error(`Error converting chat ${chatData.chat?.chatId} to MD:`, error);
+          }
+        }
+        
+        if (files.length === 0) {
+          setStatus('Ошибка: Не удалось экспортировать чаты', true);
+          return;
+        }
+
+        // If single file, download directly
+        if (files.length === 1 && files[0].content) {
+          const file = files[0];
+          const blob = new Blob([file.content], { type: 'text/html;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = file.filename;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          setStatus(`Экспортирован 1 файл: ${file.filename}`);
+        } else {
+          // Multiple files - create ZIP
+          try {
+            const JSZip = await loadJSZip();
+            const zip = new JSZip();
+            
+            for (const file of files) {
+              if (file.content && file.filename) {
+                zip.file(file.filename, file.content);
+              }
+            }
+            
+            const zipBlob = await zip.generateAsync({ type: 'blob' });
+            const zipUrl = URL.createObjectURL(zipBlob);
+            const a = document.createElement('a');
+            a.href = zipUrl;
+            a.download = `copilot_chats_${new Date().toISOString().split('T')[0]}.zip`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(zipUrl);
+            
+            setStatus(`Экспортировано ${files.length} файл(ов) в ZIP архив`);
+          } catch (zipError) {
+            console.error('Error creating ZIP:', zipError);
+            setStatus('Ошибка создания ZIP архива', true);
+          }
+        }
+      } else {
+        setStatus(`Ошибка экспорта: ${response?.error || 'Неизвестная ошибка'}`, true);
+      }
+    } catch (error) {
+      console.error('Export MD error:', error);
+      setStatus(`Ошибка: ${error.message}`, true);
     }
   });
 }
@@ -1619,6 +2059,9 @@ async function performImport(data, mergeStrategy = 'replace') {
         console.warn('Import: Warning - data verification failed after import');
         setStatus(`База данных импортирована${strategyText}. Проверка данных...`, true);
       }
+      
+      // Reinitialize reset buttons in case number of accounts changed
+      await initializeResetButtons();
       
       // Переключаемся на вкладку поиска
       setTimeout(() => {
@@ -1992,43 +2435,262 @@ if (mergeDialog) {
 }
 
 // Reset
-let resetConfirmCount = 0;
-if (resetBtn) {
-  resetBtn.addEventListener('click', () => {
-    resetConfirmCount++;
-    
-    if (resetConfirmCount === 1) {
-      setStatus('Нажмите еще раз для подтверждения сброса базы', true);
-      setTimeout(() => {
-        resetConfirmCount = 0;
-      }, 3000);
-    } else if (resetConfirmCount >= 2) {
-      resetConfirmCount = 0;
-      performReset();
-    }
-  });
+let resetConfirmCounts = new Map(); // Map<accountEmail, count>
+
+// Helper function to get correct form of "чатов/чата/чат"
+function getChatsText(count) {
+  const lastDigit = count % 10;
+  const lastTwoDigits = count % 100;
+  
+  if (lastTwoDigits >= 11 && lastTwoDigits <= 19) {
+    return 'чатов';
+  }
+  
+  if (lastDigit === 1) {
+    return 'чат';
+  } else if (lastDigit >= 2 && lastDigit <= 4) {
+    return 'чата';
+  } else {
+    return 'чатов';
+  }
 }
 
-async function performReset() {
-  if (!currentAccountEmail) {
+// Get all accounts from database
+async function getAllAccounts() {
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'GET_ACCOUNTS'
+    });
+    
+    if (response.success && response.accounts) {
+      return response.accounts;
+    }
+    return [];
+  } catch (error) {
+    console.error('Error getting accounts:', error);
+    return [];
+  }
+}
+
+// Initialize reset buttons based on number of accounts
+async function initializeResetButtons() {
+  if (!resetBtn) return;
+  
+  const accounts = await getAllAccounts();
+  const resetBtnContainer = resetBtn.parentElement;
+  
+  // Check if container exists
+  if (!resetBtnContainer) {
+    console.error('Reset button container not found');
+    return;
+  }
+  
+  // Remove old reset buttons if they exist
+  const oldResetButtons = resetBtnContainer.querySelectorAll('.reset-btn-account');
+  oldResetButtons.forEach(btn => btn.remove());
+  
+  if (accounts.length > 1) {
+    // Hide original button for multiple accounts
+    resetBtn.style.display = 'none';
+    // Create multiple buttons for each account
+    accounts.forEach(account => {
+      const accountEmail = account.email;
+      if (!accountEmail) return;
+      
+      const btn = document.createElement('button');
+      btn.className = 'action-button danger reset-btn-account';
+      btn.textContent = 'Сбросить базу';
+      const chatCount = account.chatCount || 0;
+      const chatCountText = `${chatCount} ${getChatsText(chatCount)}`;
+      btn.title = `Сбросить базу: ${accountEmail} (${chatCountText})`;
+      btn.style.position = 'relative';
+      btn.style.marginTop = '4px';
+      
+      // Add tooltip on hover
+      let tooltip = null;
+      btn.addEventListener('mouseenter', (e) => {
+        tooltip = document.createElement('div');
+        tooltip.innerHTML = `Сбросить базу: ${accountEmail}<br/><strong>${chatCountText}</strong>`;
+        tooltip.style.position = 'absolute';
+        tooltip.style.bottom = '100%';
+        tooltip.style.left = '50%';
+        tooltip.style.transform = 'translateX(-50%)';
+        tooltip.style.marginBottom = '4px';
+        tooltip.style.padding = '6px 10px';
+        tooltip.style.backgroundColor = '#333';
+        tooltip.style.color = '#fff';
+        tooltip.style.borderRadius = '4px';
+        tooltip.style.fontSize = '12px';
+        tooltip.style.zIndex = '10000';
+        tooltip.style.pointerEvents = 'none';
+        tooltip.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
+        tooltip.style.maxWidth = '300px';
+        tooltip.style.wordBreak = 'break-word';
+        tooltip.style.whiteSpace = 'normal';
+        tooltip.style.textAlign = 'center';
+        tooltip.style.lineHeight = '1.4';
+        btn.style.position = 'relative';
+        btn.appendChild(tooltip);
+      });
+      
+      btn.addEventListener('mouseleave', () => {
+        if (tooltip && tooltip.parentElement) {
+          tooltip.remove();
+          tooltip = null;
+        }
+      });
+      
+      // Add click handler
+      btn.addEventListener('click', () => {
+        const count = resetConfirmCounts.get(accountEmail) || 0;
+        resetConfirmCounts.set(accountEmail, count + 1);
+        
+        if (count === 0) {
+          setStatus(`Нажмите еще раз для подтверждения сброса базы для ${accountEmail}`, true);
+          setTimeout(() => {
+            resetConfirmCounts.set(accountEmail, 0);
+          }, 3000);
+        } else if (count >= 1) {
+          resetConfirmCounts.set(accountEmail, 0);
+          performReset(accountEmail);
+        }
+      });
+      
+      resetBtnContainer.appendChild(btn);
+    });
+  } else {
+    // Single account - show original button with tooltip
+    // Get account info for tooltip
+    const account = accounts.length > 0 ? accounts[0] : null;
+    
+    // Remove old handlers by cloning button to avoid duplicate handlers
+    if (resetBtn.parentNode) {
+      const newResetBtn = resetBtn.cloneNode(true);
+      resetBtn.parentNode.replaceChild(newResetBtn, resetBtn);
+    }
+    const resetBtnRef = document.getElementById('resetBtn');
+    if (!resetBtnRef) {
+      console.error('Reset button not found after clone');
+      return;
+    }
+    resetBtnRef.style.display = '';
+    resetBtnRef.style.position = 'relative';
+    
+    if (account) {
+      const accountEmail = account.email;
+      const chatCount = account.chatCount || 0;
+      const chatCountText = `${chatCount} ${getChatsText(chatCount)}`;
+      
+      // Add tooltip on hover
+      let tooltip = null;
+      resetBtnRef.addEventListener('mouseenter', () => {
+        if (tooltip) return; // Avoid duplicates
+        
+        tooltip = document.createElement('div');
+        tooltip.className = 'reset-tooltip';
+        tooltip.innerHTML = `Сбросить базу: ${accountEmail}<br/><strong>${chatCountText}</strong>`;
+        tooltip.style.position = 'absolute';
+        tooltip.style.bottom = '100%';
+        tooltip.style.left = '50%';
+        tooltip.style.transform = 'translateX(-50%)';
+        tooltip.style.marginBottom = '4px';
+        tooltip.style.padding = '6px 10px';
+        tooltip.style.backgroundColor = '#333';
+        tooltip.style.color = '#fff';
+        tooltip.style.borderRadius = '4px';
+        tooltip.style.fontSize = '12px';
+        tooltip.style.zIndex = '10000';
+        tooltip.style.pointerEvents = 'none';
+        tooltip.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
+        tooltip.style.maxWidth = '300px';
+        tooltip.style.wordBreak = 'break-word';
+        tooltip.style.whiteSpace = 'normal';
+        tooltip.style.textAlign = 'center';
+        tooltip.style.lineHeight = '1.4';
+        resetBtnRef.appendChild(tooltip);
+      });
+      
+      resetBtnRef.addEventListener('mouseleave', () => {
+        if (tooltip && tooltip.parentElement) {
+          tooltip.remove();
+          tooltip = null;
+        }
+      });
+    }
+    
+    // Add click handler
+    resetBtnRef.addEventListener('click', () => {
+      // Use account.email from the account object, not currentAccountEmail
+      // This ensures we reset the correct account even if currentAccountEmail is different
+      const accountEmail = account ? account.email : (currentAccountEmail || null);
+      if (!accountEmail) {
+        setStatus('Аккаунт не определен', true);
+        return;
+      }
+      
+      const count = resetConfirmCounts.get(accountEmail) || 0;
+      resetConfirmCounts.set(accountEmail, count + 1);
+      
+      if (count === 0) {
+        setStatus(`Нажмите еще раз для подтверждения сброса базы для ${accountEmail}`, true);
+        setTimeout(() => {
+          resetConfirmCounts.set(accountEmail, 0);
+        }, 3000);
+      } else if (count >= 1) {
+        resetConfirmCounts.set(accountEmail, 0);
+        performReset(accountEmail);
+      }
+    });
+  }
+}
+
+async function performReset(accountEmail) {
+  // Store the original accountEmail parameter to ensure we use the correct one
+  const targetAccountEmail = accountEmail || currentAccountEmail;
+  
+  if (!targetAccountEmail) {
     setStatus('Аккаунт не определен', true);
     return;
   }
   
-  if (!confirm('Вы уверены? Все данные будут удалены!')) {
+  // Use the target account email consistently throughout the function
+  if (!confirm(`Вы уверены? Все данные для аккаунта ${targetAccountEmail} будут удалены!`)) {
     return;
   }
   
   try {
     const response = await chrome.runtime.sendMessage({
       type: 'RESET_DB',
-      accountEmail: currentAccountEmail
+      accountEmail: targetAccountEmail
     });
     
     if (response.success) {
-      setStatus('База данных сброшена');
-      searchResults.innerHTML = '';
-      searchEmpty.style.display = 'block';
+      // Clear in-memory data only if reset account is current account
+      if (targetAccountEmail === currentAccountEmail) {
+        chatsData = [];
+        selectedChatIds.clear();
+        chatCheckboxes.clear();
+        
+        // Clear search results and input
+        if (searchResults) {
+          searchResults.innerHTML = '';
+        }
+        if (searchEmpty) {
+          searchEmpty.style.display = 'block';
+        }
+        if (searchInput) {
+          searchInput.value = '';
+        }
+        
+        // Reload chats list to show empty state
+        await loadChatsForSelection();
+      }
+      
+      setStatus(`База данных для аккаунта ${targetAccountEmail} сброшена`);
+      
+      // Reinitialize reset buttons in case account was deleted
+      await initializeResetButtons();
+      
       switchTab('index');
     } else {
       setStatus(`Ошибка сброса: ${response.error}`, true);
