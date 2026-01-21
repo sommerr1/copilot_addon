@@ -2875,15 +2875,28 @@ async function initializeResetButtons() {
     return;
   }
   
-  // Remove old reset buttons if they exist
+  // Remove old reset buttons container and buttons if they exist
+  const oldResetButtonsContainer = resetBtnContainer.querySelector('.reset-buttons-container');
+  if (oldResetButtonsContainer) {
+    oldResetButtonsContainer.remove();
+  }
   const oldResetButtons = resetBtnContainer.querySelectorAll('.reset-btn-account');
   oldResetButtons.forEach(btn => btn.remove());
   
   if (accountsWithData.length > 1) {
     // Hide original button for multiple accounts
     resetBtn.style.display = 'none';
+    
+    // Create flex container for reset buttons
+    const buttonsContainer = document.createElement('div');
+    buttonsContainer.className = 'reset-buttons-container';
+    buttonsContainer.style.display = 'flex';
+    buttonsContainer.style.flexWrap = 'wrap';
+    buttonsContainer.style.gap = '8px';
+    buttonsContainer.style.marginTop = '8px';
+    
     // Create multiple buttons for each account (only those with data)
-    accountsWithData.forEach(account => {
+    accountsWithData.forEach((account, index) => {
       const accountEmail = account.email;
       if (!accountEmail) return;
       
@@ -2894,12 +2907,12 @@ async function initializeResetButtons() {
       const chatCountText = `${chatCount} ${getChatsText(chatCount)}`;
       btn.title = `Сбросить базу: ${accountEmail} (${chatCountText})`;
       btn.style.position = 'relative';
-      btn.style.marginTop = '4px';
       
       // Add tooltip on hover
       let tooltip = null;
       btn.addEventListener('mouseenter', (e) => {
         tooltip = document.createElement('div');
+        tooltip.className = 'reset-btn-tooltip';
         tooltip.innerHTML = `Сбросить базу: ${accountEmail}<br/><strong>${chatCountText}</strong>`;
         tooltip.style.position = 'absolute';
         tooltip.style.bottom = '100%';
@@ -2907,20 +2920,81 @@ async function initializeResetButtons() {
         tooltip.style.transform = 'translateX(-50%)';
         tooltip.style.marginBottom = '4px';
         tooltip.style.padding = '6px 10px';
-        tooltip.style.backgroundColor = '#333';
-        tooltip.style.color = '#fff';
+        tooltip.style.backgroundColor = '#fff';
+        tooltip.style.color = '#1c1c1c';
+        tooltip.style.border = '1px solid #c7c7c7';
         tooltip.style.borderRadius = '4px';
         tooltip.style.fontSize = '12px';
         tooltip.style.zIndex = '10000';
         tooltip.style.pointerEvents = 'none';
-        tooltip.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
-        tooltip.style.maxWidth = '300px';
+        tooltip.style.boxShadow = '0 2px 8px rgba(0,0,0,0.15)';
+        tooltip.style.maxWidth = 'calc(100% - 24px)';
+        tooltip.style.width = 'auto';
+        tooltip.style.minWidth = '200px';
         tooltip.style.wordBreak = 'break-word';
         tooltip.style.whiteSpace = 'normal';
         tooltip.style.textAlign = 'center';
         tooltip.style.lineHeight = '1.4';
+        tooltip.style.boxSizing = 'border-box';
+        // Force styles with !important via setProperty
+        tooltip.style.setProperty('background-color', '#fff', 'important');
+        tooltip.style.setProperty('color', '#1c1c1c', 'important');
+        tooltip.style.setProperty('border', '1px solid #c7c7c7', 'important');
         btn.style.position = 'relative';
         btn.appendChild(tooltip);
+        
+        // Adjust position to stay within popup bounds
+        setTimeout(() => {
+          if (tooltip && tooltip.parentElement) {
+            const popupWidth = window.innerWidth || 420; // Popup width (420px from CSS)
+            const padding = 12;
+            const tooltipRect = tooltip.getBoundingClientRect();
+            const btnRect = btn.getBoundingClientRect();
+            
+            // Calculate tooltip center position relative to button
+            const btnCenterX = btnRect.left + btnRect.width / 2;
+            const tooltipLeft = btnCenterX - tooltipRect.width / 2;
+            const tooltipRight = tooltipLeft + tooltipRect.width;
+            
+            let leftOffset = 0;
+            
+            // Check if tooltip goes beyond right edge
+            if (tooltipRight > popupWidth - padding) {
+              leftOffset = (popupWidth - padding) - tooltipRight;
+            }
+            
+            // Check if tooltip goes beyond left edge
+            if (tooltipLeft < padding) {
+              leftOffset = padding - tooltipLeft;
+            }
+            
+            if (leftOffset !== 0) {
+              tooltip.style.transform = `translateX(calc(-50% + ${leftOffset}px))`;
+            }
+            
+            // Adjust width if needed to fit within popup
+            const maxTooltipWidth = popupWidth - (padding * 2);
+            if (tooltipRect.width > maxTooltipWidth) {
+              tooltip.style.maxWidth = `${maxTooltipWidth}px`;
+              tooltip.style.width = `${maxTooltipWidth}px`;
+              // Recalculate position after width change
+              setTimeout(() => {
+                const newTooltipRect = tooltip.getBoundingClientRect();
+                const newTooltipLeft = btnCenterX - newTooltipRect.width / 2;
+                let newLeftOffset = 0;
+                if (newTooltipLeft + newTooltipRect.width > popupWidth - padding) {
+                  newLeftOffset = (popupWidth - padding) - (newTooltipLeft + newTooltipRect.width);
+                }
+                if (newTooltipLeft < padding) {
+                  newLeftOffset = padding - newTooltipLeft;
+                }
+                if (newLeftOffset !== 0) {
+                  tooltip.style.transform = `translateX(calc(-50% + ${newLeftOffset}px))`;
+                }
+              }, 0);
+            }
+          }
+        }, 0);
       });
       
       btn.addEventListener('mouseleave', () => {
@@ -2946,8 +3020,11 @@ async function initializeResetButtons() {
         }
       });
       
-      resetBtnContainer.appendChild(btn);
+      buttonsContainer.appendChild(btn);
     });
+    
+    // Insert container after resetBtn
+    resetBtnContainer.insertBefore(buttonsContainer, resetBtn.nextSibling);
   } else {
     // Single account - show original button with tooltip
     // Get account info for tooltip (only if it has data)
@@ -2985,19 +3062,80 @@ async function initializeResetButtons() {
         tooltip.style.transform = 'translateX(-50%)';
         tooltip.style.marginBottom = '4px';
         tooltip.style.padding = '6px 10px';
-        tooltip.style.backgroundColor = '#333';
-        tooltip.style.color = '#fff';
+        tooltip.style.backgroundColor = '#fff';
+        tooltip.style.color = '#1c1c1c';
+        tooltip.style.border = '1px solid #c7c7c7';
         tooltip.style.borderRadius = '4px';
         tooltip.style.fontSize = '12px';
         tooltip.style.zIndex = '10000';
         tooltip.style.pointerEvents = 'none';
-        tooltip.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
-        tooltip.style.maxWidth = '300px';
+        tooltip.style.boxShadow = '0 2px 8px rgba(0,0,0,0.15)';
+        tooltip.style.maxWidth = 'calc(100% - 24px)';
+        tooltip.style.width = 'auto';
+        tooltip.style.minWidth = '200px';
         tooltip.style.wordBreak = 'break-word';
         tooltip.style.whiteSpace = 'normal';
         tooltip.style.textAlign = 'center';
         tooltip.style.lineHeight = '1.4';
+        tooltip.style.boxSizing = 'border-box';
+        // Force styles with !important via setProperty
+        tooltip.style.setProperty('background-color', '#fff', 'important');
+        tooltip.style.setProperty('color', '#1c1c1c', 'important');
+        tooltip.style.setProperty('border', '1px solid #c7c7c7', 'important');
         resetBtnRef.appendChild(tooltip);
+        
+        // Adjust position to stay within popup bounds
+        setTimeout(() => {
+          if (tooltip && tooltip.parentElement) {
+            const popupWidth = window.innerWidth || 420; // Popup width (420px from CSS)
+            const padding = 12;
+            const tooltipRect = tooltip.getBoundingClientRect();
+            const btnRect = resetBtnRef.getBoundingClientRect();
+            
+            // Calculate tooltip center position relative to button
+            const btnCenterX = btnRect.left + btnRect.width / 2;
+            const tooltipLeft = btnCenterX - tooltipRect.width / 2;
+            const tooltipRight = tooltipLeft + tooltipRect.width;
+            
+            let leftOffset = 0;
+            
+            // Check if tooltip goes beyond right edge
+            if (tooltipRight > popupWidth - padding) {
+              leftOffset = (popupWidth - padding) - tooltipRight;
+            }
+            
+            // Check if tooltip goes beyond left edge
+            if (tooltipLeft < padding) {
+              leftOffset = padding - tooltipLeft;
+            }
+            
+            if (leftOffset !== 0) {
+              tooltip.style.transform = `translateX(calc(-50% + ${leftOffset}px))`;
+            }
+            
+            // Adjust width if needed to fit within popup
+            const maxTooltipWidth = popupWidth - (padding * 2);
+            if (tooltipRect.width > maxTooltipWidth) {
+              tooltip.style.maxWidth = `${maxTooltipWidth}px`;
+              tooltip.style.width = `${maxTooltipWidth}px`;
+              // Recalculate position after width change
+              setTimeout(() => {
+                const newTooltipRect = tooltip.getBoundingClientRect();
+                const newTooltipLeft = btnCenterX - newTooltipRect.width / 2;
+                let newLeftOffset = 0;
+                if (newTooltipLeft + newTooltipRect.width > popupWidth - padding) {
+                  newLeftOffset = (popupWidth - padding) - (newTooltipLeft + newTooltipRect.width);
+                }
+                if (newTooltipLeft < padding) {
+                  newLeftOffset = padding - newTooltipLeft;
+                }
+                if (newLeftOffset !== 0) {
+                  tooltip.style.transform = `translateX(calc(-50% + ${newLeftOffset}px))`;
+                }
+              }, 0);
+            }
+          }
+        }, 0);
       });
       
       resetBtnRef.addEventListener('mouseleave', () => {
