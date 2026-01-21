@@ -125,6 +125,13 @@ function convertHtmlToMarkdown(html) {
         const cellText = childText.replace(/\|/g, '\\|');
         return ` ${cellText} |`;
       case 'div':
+        // Check if it's a Copilot separator (divider)
+        const classList = node.classList?.toString() || '';
+        if (classList.includes('relative') && classList.includes('pb-6') && 
+            classList.includes('w-full') && (classList.includes('after:border-b') || 
+            node.getAttribute('class')?.includes('after:border-b'))) {
+          return '---\n\n';
+        }
         // Check if it's a code block wrapper
         if (node.classList?.contains('code') || node.querySelector('pre, code')) {
           return childText;
@@ -279,20 +286,184 @@ async function exportChatsToMarkdown(chatIds, accountEmail, getMessagesHtml = nu
   return results;
 }
 
+/**
+ * Convert full Copilot HTML file to Markdown for Obsidian
+ * Extracts messages with proper dialog separation, formatting, and pseudocode
+ * @param {string} htmlContent - Full HTML content from Copilot page
+ * @returns {string} Markdown formatted text for Obsidian
+ */
+function convertCopilotHtmlFileToMarkdown(htmlContent) {
+  if (!htmlContent || typeof htmlContent !== 'string') {
+    return '';
+  }
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(htmlContent, 'text/html');
+  const body = doc.body;
+
+  if (!body) {
+    return '';
+  }
+
+  // Remove UI elements
+  const selectorsToRemove = [
+    'img',
+    '.sr-only',
+    '[data-testid="sticky-header"]',
+    '[data-testid="date-divider"]',
+    'svg',
+    'button:not([data-content])',
+    'nav',
+    'header',
+    'footer',
+    '[data-testid="message-item-reactions"]',
+    '[aria-hidden="true"]',
+    '.hidden',
+    '[style*="display: none"]',
+    'script',
+    'style'
+  ];
+  
+  selectorsToRemove.forEach(sel => {
+    try {
+      body.querySelectorAll(sel).forEach(el => el.remove());
+    } catch (e) {
+      // Ignore selector errors
+    }
+  });
+
+  // Extract messages in order
+  const messages = [];
+  const messageElements = body.querySelectorAll('[role="article"]');
+
+  for (const msgEl of messageElements) {
+    // Determine message type
+    const isUser = msgEl.querySelector('[data-content="user-message"]') || 
+                   msgEl.getAttribute('aria-labelledby')?.includes('user-message') ||
+                   msgEl.querySelector('[data-testid*="user-message"]') ||
+                   msgEl.classList.toString().includes('user-message');
+    
+    const isAssistant = msgEl.querySelector('[data-content="ai-message"]') ||
+                        msgEl.getAttribute('aria-labelledby')?.includes('ai-message') ||
+                        msgEl.getAttribute('aria-labelledby')?.includes('author') ||
+                        msgEl.querySelector('[data-testid*="ai-message"]') ||
+                        msgEl.classList.toString().includes('ai-message') ||
+                        msgEl.classList.toString().includes('assistant-message');
+    
+    if (!isUser && !isAssistant) {
+      continue;
+    }
+
+    // Get content element
+    let contentElement = msgEl;
+    if (isAssistant) {
+      const contentContainer = msgEl.querySelector('[data-content="ai-message"]') || 
+                              msgEl.querySelector('[class*="message-content"]') ||
+                              msgEl.querySelector('[class*="response-content"]') ||
+                              msgEl.querySelector('[class*="ai-message-item"]') ||
+                              msgEl;
+      contentElement = contentContainer;
+    }
+
+    // Extract HTML content
+    const html = contentElement.innerHTML || '';
+    const text = contentElement.textContent?.trim() || '';
+    
+    if (text.length > 0) {
+      // Try to get timestamp
+      const timeEl = msgEl.querySelector('time') || 
+                    msgEl.querySelector('[data-testid*="date"]') ||
+                    msgEl.closest('[role="article"]')?.querySelector('time');
+      const timestamp = timeEl ? (timeEl.getAttribute('datetime') || timeEl.textContent) : null;
+      
+      messages.push({
+        role: isUser ? 'user' : 'assistant',
+        html: html,
+        text: text,
+        timestamp: timestamp,
+        domOrder: Array.from(messageElements).indexOf(msgEl)
+      });
+    }
+  }
+
+  // If no messages found via role="article", try alternative selectors
+  if (messages.length === 0) {
+    const userMessages = body.querySelectorAll('[data-content="user-message"]');
+    const aiMessages = body.querySelectorAll('[data-content="ai-message"]');
+    
+    const allElements = [];
+    userMessages.forEach(el => allElements.push({ el, role: 'user' }));
+    aiMessages.forEach(el => allElements.push({ el, role: 'assistant' }));
+    
+    // Sort by DOM position
+    allElements.sort((a, b) => {
+      const posA = Array.from(body.querySelectorAll('*')).indexOf(a.el);
+      const posB = Array.from(body.querySelectorAll('*')).indexOf(b.el);
+      return posA - posB;
+    });
+
+    allElements.forEach(({ el, role }) => {
+      const html = el.innerHTML || '';
+      const text = el.textContent?.trim() || '';
+      if (text.length > 0) {
+        messages.push({
+          role: role,
+          html: html,
+          text: text,
+          timestamp: null,
+          domOrder: Array.from(body.querySelectorAll('*')).indexOf(el)
+        });
+      }
+    });
+  }
+
+  // Sort messages by DOM order
+  messages.sort((a, b) => a.domOrder - b.domOrder);
+
+  // Build markdown
+  let markdown = '# Диалог Copilot\n\n';
+  markdown += `**Дата конвертации:** ${new Date().toLocaleString('ru-RU')}\n\n`;
+  markdown += '---\n\n';
+
+  // Convert each message
+  for (const message of messages) {
+    const role = message.role;
+    const content = convertHtmlToMarkdown(message.html || message.text);
+    
+    if (role === 'user') {
+      markdown += `## 👤 Пользователь${message.timestamp ? ` (${message.timestamp})` : ''}\n\n${content}\n\n`;
+    } else if (role === 'assistant') {
+      markdown += `## 🤖 Copilot${message.timestamp ? ` (${message.timestamp})` : ''}\n\n${content}\n\n`;
+    }
+  }
+
+  // Clean up multiple blank lines
+  markdown = markdown.replace(/\n{3,}/g, '\n\n');
+  
+  // Clean up trailing whitespace
+  markdown = markdown.split('\n').map(line => line.trimEnd()).join('\n');
+
+  return markdown.trim();
+}
+
 // Export for use in service worker
 if (typeof self !== 'undefined') {
   self.ExportMD = {
     convertHtmlToMarkdown,
     formatMessageForMarkdown,
     exportChatToMarkdown,
-    exportChatsToMarkdown
+    exportChatsToMarkdown,
+    convertCopilotHtmlFileToMarkdown
   };
 }
 
 // Export for ES modules
+// Note: When loaded via importScripts() in service worker, these exports are ignored
+// and self.ExportMD is used instead
 export {
   convertHtmlToMarkdown,
   formatMessageForMarkdown,
   exportChatToMarkdown,
-  exportChatsToMarkdown
+  exportChatsToMarkdown,
+  convertCopilotHtmlFileToMarkdown
 };

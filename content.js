@@ -932,7 +932,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         role: msg.role,
         text: msg.text,
         html: msg.html || null,
-        timestampUTC: msg.timestampUTC
+        timestampUTC: msg.timestampUTC,
+        domOrder: msg.domOrder !== undefined ? msg.domOrder : index // Сохраняем порядок DOM
       }))
     });
     return true;

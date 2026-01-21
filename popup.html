@@ -69,6 +69,42 @@
           </div>
         </div>
         
+        <!-- Markdown Export Section -->
+        <div class="indexing-section">
+          <div class="indexing-header">
+            <button id="mdExportToggleBtn" class="index-toggle-button">
+              <span class="toggle-icon">▼</span>
+              <span>Экспорт в .md</span>
+              <span id="mdExportStats" class="indexing-stats"></span>
+            </button>
+            <div id="mdExportInfo" class="indexing-info hidden"></div>
+            <button id="mdExportControlBtn" class="index-control-button">Начать экспорт</button>
+          </div>
+          <div id="mdExportContent" class="indexing-content collapsed">
+            <!-- Chat Selection for Markdown Export -->
+            <div id="mdChatSelectionContainer" class="chat-selection-container">
+              <div class="chat-selection-header">
+                <label class="select-all-checkbox">
+                  <input type="checkbox" id="selectAllMdChats" />
+                  <span>Выбрать все</span>
+                </label>
+                <div class="sort-controls">
+                  <select id="mdSortBy" class="sort-select">
+                    <option value="date-desc">По дате (позднее)</option>
+                    <option value="date-asc">По дате (раньше)</option>
+                    <option value="checked">Чекнутые</option>
+                    <option value="unchecked">Анчекнутые</option>
+                    <option value="alphabet">По алфавиту</option>
+                  </select>
+                </div>
+              </div>
+              <div id="mdChatsList" class="chats-list">
+                <div class="loading-chats">Загрузка чатов...</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        
         <button id="exportBtn" class="action-button">Сохранить базу</button>
         <button id="importBtn" class="action-button">Загрузить базу</button>
         <input type="file" id="importFile" accept=".json,.zip" multiple style="display: none;" />
@@ -160,8 +196,8 @@
                 <span class="modal-option-desc">Все данные будут сохранены в один файл</span>
               </span>
             </label>
-            <label class="modal-option">
-              <input type="radio" name="exportStrategy" value="by_month" />
+            <label class="modal-option modal-option-disabled">
+              <input type="radio" name="exportStrategy" value="by_month" disabled />
               <span class="modal-option-label">
                 <strong>По месяцам</strong>
                 <span class="modal-option-desc">Данные будут разделены по месяцам и сохранены в ZIP архив</span>

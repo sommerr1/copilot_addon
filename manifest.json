@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Copilot Chat Indexer",
-  "version": "1.01.03",
-  "versiondescription": "Added refresh button in header, added account filter checkboxes in search results with chat count display, fixed checkbox color visibility issue",
+  "version": "1.01.04",
+  "versiondescription": "Added Markdown export functionality with chat selection, grouping by months, and ZIP archive creation",
   "description": "Local indexing and search for Microsoft Copilot chats",
   "permissions": ["tabs", "webRequest", "storage", "debugger", "windows", "scripting", "downloads"],
   "host_permissions": ["*://copilot.microsoft.com/*"],

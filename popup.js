@@ -91,6 +91,21 @@ const exportOptionsConfirm = document.getElementById('exportOptionsConfirm');
 const partsInputContainer = document.getElementById('partsInputContainer');
 const partsCountInput = document.getElementById('partsCountInput');
 
+// Markdown Export UI Elements
+const mdExportToggleBtn = document.getElementById('mdExportToggleBtn');
+const mdExportStats = document.getElementById('mdExportStats');
+const mdExportInfo = document.getElementById('mdExportInfo');
+const mdExportControlBtn = document.getElementById('mdExportControlBtn');
+const mdExportContent = document.getElementById('mdExportContent');
+const mdChatsList = document.getElementById('mdChatsList');
+const selectAllMdChats = document.getElementById('selectAllMdChats');
+const mdSortBy = document.getElementById('mdSortBy');
+
+// Markdown Export State
+let mdChatsData = [];
+let mdSelectedChatIds = new Set();
+let mdChatCheckboxes = new Map();
+
 // Tab switching
 function switchTab(tabName) {
   // Remove active from all tabs
@@ -432,6 +447,9 @@ async function init() {
   // Initialize chat selection
   setupChatSelection();
   
+  // Initialize Markdown export selection
+  setupMdExportSelection();
+  
   // Initialize reset buttons (multiple if multiple accounts)
   await initializeResetButtons();
   
@@ -450,11 +468,35 @@ function setupChatSelection() {
   // Toggle indexing section
   if (indexToggleBtn && indexingContent) {
     indexToggleBtn.addEventListener('click', () => {
+      const isCollapsed = indexingContent.classList.contains('collapsed');
       indexingContent.classList.toggle('collapsed');
+      const toggleIcon = indexToggleBtn.querySelector('.toggle-icon');
+      if (toggleIcon) {
+        toggleIcon.textContent = indexingContent.classList.contains('collapsed') ? '▶' : '▼';
+      }
+      
+      // Находим секцию экспорта в MD и скрываем/показываем её
+      const mdExportSection = mdExportToggleBtn?.closest('.indexing-section');
+      if (mdExportSection) {
+        if (!indexingContent.classList.contains('collapsed')) {
+          // Индексация раскрыта - скрываем секцию экспорта
+          mdExportSection.style.display = 'none';
+        } else {
+          // Индексация свернута - показываем секцию экспорта
+          mdExportSection.style.display = '';
+        }
+      }
+      
       if (!indexingContent.classList.contains('collapsed')) {
         loadChatsForSelection();
       }
     });
+    
+    // Initialize toggle icon
+    const toggleIcon = indexToggleBtn.querySelector('.toggle-icon');
+    if (toggleIcon && indexingContent && indexingContent.classList.contains('collapsed')) {
+      toggleIcon.textContent = '▶';
+    }
   }
   
   // Select all checkbox
@@ -497,6 +539,575 @@ function setupChatSelection() {
     selectedChatIds.clear();
     chatCheckboxes.clear();
   });
+}
+
+// Setup Markdown export selection UI
+function setupMdExportSelection() {
+  // Toggle MD export section
+  if (mdExportToggleBtn && mdExportContent) {
+    mdExportToggleBtn.addEventListener('click', () => {
+      const isCollapsed = mdExportContent.classList.contains('collapsed');
+      mdExportContent.classList.toggle('collapsed');
+      const toggleIcon = mdExportToggleBtn.querySelector('.toggle-icon');
+      if (toggleIcon) {
+        toggleIcon.textContent = mdExportContent.classList.contains('collapsed') ? '▶' : '▼';
+      }
+      
+      // Находим секцию индексации и скрываем/показываем её
+      const indexingSection = indexToggleBtn?.closest('.indexing-section');
+      if (indexingSection) {
+        if (!mdExportContent.classList.contains('collapsed')) {
+          // Экспорт раскрыт - скрываем секцию индексации
+          indexingSection.style.display = 'none';
+        } else {
+          // Экспорт свернут - показываем секцию индексации
+          indexingSection.style.display = '';
+        }
+      }
+      
+      if (!mdExportContent.classList.contains('collapsed')) {
+        loadChatsForMdExport();
+      }
+    });
+    
+    // Initialize toggle icon
+    const toggleIcon = mdExportToggleBtn.querySelector('.toggle-icon');
+    if (toggleIcon && mdExportContent && mdExportContent.classList.contains('collapsed')) {
+      toggleIcon.textContent = '▶';
+    }
+  }
+  
+  // Select all checkbox for MD export
+  if (selectAllMdChats) {
+    selectAllMdChats.addEventListener('change', (e) => {
+      const checked = e.target.checked;
+      mdChatCheckboxes.forEach((checkbox, chatId) => {
+        checkbox.checked = checked;
+        if (checked) {
+          mdSelectedChatIds.add(chatId);
+        } else {
+          mdSelectedChatIds.delete(chatId);
+        }
+      });
+      
+      // Update month checkboxes if date sorting is active
+      const sortValue = mdSortBy?.value;
+      if (mdChatsList && (sortValue === 'date-desc' || sortValue === 'date-asc')) {
+        const monthCheckboxes = mdChatsList.querySelectorAll('.month-checkbox');
+        monthCheckboxes.forEach(monthCheckbox => {
+          monthCheckbox.checked = checked;
+          monthCheckbox.indeterminate = false;
+        });
+      }
+      
+      updateMdSelectAllState();
+      updateMdExportStats();
+    });
+  }
+  
+  // Sort control for MD export
+  if (mdSortBy) {
+    mdSortBy.addEventListener('change', () => {
+      renderMdChatsList();
+    });
+  }
+  
+  // Export button
+  if (mdExportControlBtn) {
+    mdExportControlBtn.addEventListener('click', () => {
+      startMdExport();
+    });
+  }
+  
+  // Reset state on popup close
+  window.addEventListener('beforeunload', () => {
+    mdChatsData = [];
+    mdSelectedChatIds.clear();
+    mdChatCheckboxes.clear();
+  });
+}
+
+// Load chats for MD export selection
+async function loadChatsForMdExport() {
+  if (!currentAccountEmail) return;
+  if (!mdChatsList) return;
+  
+  mdChatsList.innerHTML = '<div class="loading-chats">Загрузка чатов...</div>';
+  
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'GET_CHATS_FOR_SELECTION',
+      accountEmail: currentAccountEmail
+    });
+    
+    if (response.success && response.chats) {
+      mdChatsData = response.chats;
+      initializeMdChatSelection();
+      renderMdChatsList();
+      updateMdExportStats();
+    } else {
+      if (mdChatsList) {
+        mdChatsList.innerHTML = '<div class="empty-chats">Ошибка загрузки чатов</div>';
+      }
+    }
+  } catch (error) {
+    if (mdChatsList) {
+      mdChatsList.innerHTML = `<div class="empty-chats">Ошибка: ${error.message}</div>`;
+    }
+  }
+}
+
+// Initialize MD chat selection state
+function initializeMdChatSelection() {
+  mdSelectedChatIds.clear();
+  mdChatCheckboxes.clear();
+  
+  // По умолчанию все чаты не выбраны для экспорта
+  mdChatsData.forEach(chat => {
+    // Можно выбрать все или оставить пустым - пользователь сам выберет
+  });
+}
+
+// Render MD chats list (reuse logic from renderChatsList)
+function renderMdChatsList() {
+  if (!mdChatsList) return;
+  
+  if (mdChatsData.length === 0) {
+    mdChatsList.innerHTML = '<div class="empty-chats">Нет чатов для экспорта</div>';
+    return;
+  }
+  
+  // Sort chats
+  const sortedChats = [...mdChatsData];
+  const sortValue = mdSortBy?.value || 'date-desc';
+  
+  sortedChats.sort((a, b) => {
+    switch (sortValue) {
+      case 'date-desc':
+        return new Date(b.updatedAtUTC || 0) - new Date(a.updatedAtUTC || 0);
+      case 'date-asc':
+        return new Date(a.updatedAtUTC || 0) - new Date(b.updatedAtUTC || 0);
+      case 'checked':
+        const aChecked = mdSelectedChatIds.has(a.chatId);
+        const bChecked = mdSelectedChatIds.has(b.chatId);
+        if (aChecked === bChecked) return 0;
+        return aChecked ? -1 : 1;
+      case 'unchecked':
+        const aUnchecked = !mdSelectedChatIds.has(a.chatId);
+        const bUnchecked = !mdSelectedChatIds.has(b.chatId);
+        if (aUnchecked === bUnchecked) return 0;
+        return aUnchecked ? -1 : 1;
+      case 'alphabet':
+        return (a.title || '').localeCompare(b.title || '', 'ru');
+      default:
+        return 0;
+    }
+  });
+  
+  // Check if sorting by date
+  const isDateSorting = sortValue === 'date-desc' || sortValue === 'date-asc';
+  
+  // Render
+  mdChatsList.innerHTML = '';
+  
+  if (isDateSorting) {
+    // Group chats by month
+    const chatsByMonth = new Map();
+    sortedChats.forEach(chat => {
+      const monthKey = getMonthKey(chat.updatedAtUTC) || 'no-date';
+      if (!chatsByMonth.has(monthKey)) {
+        chatsByMonth.set(monthKey, []);
+      }
+      chatsByMonth.get(monthKey).push(chat);
+    });
+    
+    // Sort month keys
+    const sortedMonthKeys = Array.from(chatsByMonth.keys()).sort((a, b) => {
+      if (a === 'no-date') return 1;
+      if (b === 'no-date') return -1;
+      return sortValue === 'date-desc' ? b.localeCompare(a) : a.localeCompare(b);
+    });
+    
+    // Render with month separators
+    sortedMonthKeys.forEach((monthKey, monthIndex) => {
+      const monthChats = chatsByMonth.get(monthKey);
+      const monthName = monthKey === 'no-date' 
+        ? 'Без даты' 
+        : formatMonthName(monthChats[0].updatedAtUTC);
+      
+      // Month separator with checkbox
+      const monthSeparator = document.createElement('div');
+      monthSeparator.className = 'month-separator';
+      monthSeparator.dataset.monthKey = monthKey;
+      monthSeparator.id = `md-month-separator-${monthKey}`;
+      
+      const monthCheckbox = document.createElement('input');
+      monthCheckbox.type = 'checkbox';
+      monthCheckbox.className = 'month-checkbox';
+      monthCheckbox.id = `md-month-${monthKey}`;
+      
+      const allSelected = monthChats.every(chat => mdSelectedChatIds.has(chat.chatId));
+      const someSelected = monthChats.some(chat => mdSelectedChatIds.has(chat.chatId));
+      monthCheckbox.checked = allSelected;
+      monthCheckbox.indeterminate = someSelected && !allSelected;
+      
+      monthCheckbox.dataset.monthKey = monthKey;
+      
+      monthCheckbox.addEventListener('change', (e) => {
+        const checked = e.target.checked;
+        monthChats.forEach(chat => {
+          if (checked) {
+            mdSelectedChatIds.add(chat.chatId);
+          } else {
+            mdSelectedChatIds.delete(chat.chatId);
+          }
+          const chatCheckbox = mdChatCheckboxes.get(chat.chatId);
+          if (chatCheckbox) {
+            chatCheckbox.checked = checked;
+          }
+        });
+        updateMdSelectAllState();
+        updateMdExportStats();
+      });
+      
+      const monthLabel = document.createElement('label');
+      monthLabel.className = 'month-label';
+      monthLabel.htmlFor = `md-month-${monthKey}`;
+      monthLabel.textContent = monthName;
+      
+      const monthCount = document.createElement('span');
+      monthCount.className = 'month-count';
+      monthCount.textContent = `(${monthChats.length})`;
+      
+      // Navigation arrows container
+      const navArrows = document.createElement('div');
+      navArrows.className = 'month-nav-arrows';
+      
+      // Up arrow (previous month)
+      const upArrow = document.createElement('button');
+      upArrow.className = 'month-nav-arrow month-nav-arrow-up';
+      upArrow.type = 'button';
+      upArrow.innerHTML = '▲';
+      upArrow.title = 'Предыдущий месяц';
+      upArrow.setAttribute('aria-label', 'Предыдущий месяц');
+      
+      // Down arrow (next month)
+      const downArrow = document.createElement('button');
+      downArrow.className = 'month-nav-arrow month-nav-arrow-down';
+      downArrow.type = 'button';
+      downArrow.innerHTML = '▼';
+      downArrow.title = 'Следующий месяц';
+      downArrow.setAttribute('aria-label', 'Следующий месяц');
+      
+      // Determine if arrows should be disabled
+      const isFirstMonth = monthIndex === 0;
+      const isLastMonth = monthIndex === sortedMonthKeys.length - 1;
+      
+      if (isFirstMonth) {
+        upArrow.disabled = true;
+        upArrow.classList.add('disabled');
+      }
+      
+      if (isLastMonth) {
+        downArrow.disabled = true;
+        downArrow.classList.add('disabled');
+      }
+      
+      // Navigation handlers
+      upArrow.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        if (!isFirstMonth && monthIndex > 0) {
+          const prevMonthKey = sortedMonthKeys[monthIndex - 1];
+          scrollToMdMonth(prevMonthKey);
+        }
+      });
+      
+      downArrow.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        if (!isLastMonth && monthIndex < sortedMonthKeys.length - 1) {
+          const nextMonthKey = sortedMonthKeys[monthIndex + 1];
+          scrollToMdMonth(nextMonthKey);
+        }
+      });
+      
+      navArrows.appendChild(upArrow);
+      navArrows.appendChild(downArrow);
+      
+      monthSeparator.appendChild(monthCheckbox);
+      monthSeparator.appendChild(monthLabel);
+      monthSeparator.appendChild(monthCount);
+      monthSeparator.appendChild(navArrows);
+      mdChatsList.appendChild(monthSeparator);
+      
+      // Render chats for this month
+      monthChats.forEach(chat => {
+        const item = document.createElement('div');
+        item.className = 'chat-item';
+        
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'chat-checkbox';
+        checkbox.id = `md-chat-${chat.chatId}`;
+        checkbox.checked = mdSelectedChatIds.has(chat.chatId);
+        checkbox.dataset.monthKey = monthKey;
+        checkbox.addEventListener('change', (e) => {
+          if (e.target.checked) {
+            mdSelectedChatIds.add(chat.chatId);
+          } else {
+            mdSelectedChatIds.delete(chat.chatId);
+          }
+          updateMdMonthCheckboxState(monthKey);
+          updateMdSelectAllState();
+          updateMdExportStats();
+        });
+        
+        mdChatCheckboxes.set(chat.chatId, checkbox);
+        
+        const info = document.createElement('div');
+        info.className = 'chat-info';
+        
+        const title = document.createElement('div');
+        title.className = 'chat-title';
+        title.textContent = chat.title || 'Без названия';
+        
+        const date = document.createElement('div');
+        date.className = 'chat-date';
+        date.textContent = chat.updatedAtUTC ? formatDate(chat.updatedAtUTC) : 'Дата неизвестна';
+        
+        info.appendChild(title);
+        info.appendChild(date);
+        
+        item.appendChild(checkbox);
+        item.appendChild(info);
+        mdChatsList.appendChild(item);
+      });
+    });
+  } else {
+    // Render without month separators
+    sortedChats.forEach(chat => {
+      const item = document.createElement('div');
+      item.className = 'chat-item';
+      
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'chat-checkbox';
+      checkbox.id = `md-chat-${chat.chatId}`;
+      checkbox.checked = mdSelectedChatIds.has(chat.chatId);
+      checkbox.addEventListener('change', (e) => {
+        if (e.target.checked) {
+          mdSelectedChatIds.add(chat.chatId);
+        } else {
+          mdSelectedChatIds.delete(chat.chatId);
+        }
+        updateMdSelectAllState();
+        updateMdExportStats();
+      });
+      
+      mdChatCheckboxes.set(chat.chatId, checkbox);
+      
+      const info = document.createElement('div');
+      info.className = 'chat-info';
+      
+      const title = document.createElement('div');
+      title.className = 'chat-title';
+      title.textContent = chat.title || 'Без названия';
+      
+      const date = document.createElement('div');
+      date.className = 'chat-date';
+      date.textContent = chat.updatedAtUTC ? formatDate(chat.updatedAtUTC) : 'Дата неизвестна';
+      
+      info.appendChild(title);
+      info.appendChild(date);
+      
+      item.appendChild(checkbox);
+      item.appendChild(info);
+      mdChatsList.appendChild(item);
+    });
+  }
+  
+  updateMdSelectAllState();
+  updateMdExportStats();
+}
+
+// Update MD month checkbox state
+function updateMdMonthCheckboxState(monthKey) {
+  const monthCheckbox = document.getElementById(`md-month-${monthKey}`);
+  if (!monthCheckbox) return;
+  
+  const monthChats = mdChatsData.filter(chat => {
+    const chatMonthKey = getMonthKey(chat.updatedAtUTC) || 'no-date';
+    return chatMonthKey === monthKey;
+  });
+  
+  if (monthChats.length === 0) return;
+  
+  const allSelected = monthChats.every(chat => mdSelectedChatIds.has(chat.chatId));
+  const someSelected = monthChats.some(chat => mdSelectedChatIds.has(chat.chatId));
+  
+  monthCheckbox.checked = allSelected;
+  monthCheckbox.indeterminate = someSelected && !allSelected;
+}
+
+// Update MD select all state
+function updateMdSelectAllState() {
+  if (!selectAllMdChats) return;
+  
+  const totalChats = mdChatsData.length;
+  if (totalChats === 0) {
+    selectAllMdChats.checked = false;
+    selectAllMdChats.indeterminate = false;
+    return;
+  }
+  
+  const selectedCount = mdSelectedChatIds.size;
+  const allSelected = selectedCount === totalChats;
+  const someSelected = selectedCount > 0 && selectedCount < totalChats;
+  
+  selectAllMdChats.checked = allSelected;
+  selectAllMdChats.indeterminate = someSelected;
+}
+
+// Update MD export stats
+function updateMdExportStats() {
+  if (!mdExportStats) return;
+  
+  const selectedCount = mdSelectedChatIds.size;
+  const totalCount = mdChatsData.length;
+  
+  if (totalCount === 0) {
+    mdExportStats.textContent = '';
+    return;
+  }
+  
+  mdExportStats.textContent = `${selectedCount}/${totalCount}`;
+}
+
+// Start MD export
+async function startMdExport() {
+  if (!currentAccountEmail) {
+    setStatus('Откройте страницу Copilot для определения аккаунта', true);
+    return;
+  }
+  
+  if (mdSelectedChatIds.size === 0) {
+    setStatus('Выберите хотя бы один чат для экспорта', true);
+    return;
+  }
+  
+  const chatIds = Array.from(mdSelectedChatIds);
+  
+  try {
+    setStatus(`Экспорт ${chatIds.length} чат(ов) в Markdown...`);
+    
+    if (mdExportInfo) {
+      mdExportInfo.textContent = `Экспорт ${chatIds.length} чат(ов)...`;
+      mdExportInfo.classList.remove('hidden');
+    }
+    
+    const response = await chrome.runtime.sendMessage({
+      type: 'EXPORT_TO_MARKDOWN',
+      accountEmail: currentAccountEmail,
+      chatIds: chatIds
+    });
+    
+    if (response && response.success) {
+      // Case 1: ZIP blob was created in service worker
+      if (response.zipBlob && Array.isArray(response.zipBlob)) {
+        // Convert array back to Uint8Array
+        const uint8Array = new Uint8Array(response.zipBlob);
+        const blob = new Blob([uint8Array], { type: 'application/zip' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = response.filename || 'copilot_chats_export.zip';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        setStatus(`Экспорт завершен: ${response.filename || 'copilot_chats_export.zip'} (${response.fileCount || 0} файл(ов))`);
+      }
+      // Case 2: Files need ZIP creation in popup or single file download
+      else if (response.files && response.files.length > 0) {
+        if (response.files.length === 1 && !response.needsZipCreation) {
+          // Single file - download directly
+          const file = response.files[0];
+          const blob = new Blob([file.content], { type: 'text/markdown;charset=utf-8' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = file.filename;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          
+          setStatus(`Экспорт завершен: ${file.filename}`);
+        } else {
+          // Multiple files - create ZIP
+          setStatus(`Создание ZIP архива из ${response.files.length} файл(ов)...`);
+          
+          try {
+            const zipLib = await loadJSZip();
+            const zip = new zipLib();
+            
+            // Add all files to ZIP
+            for (const file of response.files) {
+              if (file.content) {
+                zip.file(file.filename, file.content);
+              }
+            }
+            
+            // Generate ZIP
+            const zipBlob = await zip.generateAsync({ 
+              type: 'blob',
+              compression: 'DEFLATE',
+              compressionOptions: { level: 6 }
+            });
+            
+            // Download ZIP
+            const url = URL.createObjectURL(zipBlob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = response.filename || 'copilot_chats_export.zip';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            setStatus(`Экспорт завершен: ${response.filename || 'copilot_chats_export.zip'} (${response.files.length} файл(ов))`);
+          } catch (zipError) {
+            console.error('ZIP creation error:', zipError);
+            setStatus(`Ошибка создания ZIP: ${zipError.message}`, true);
+          }
+        }
+      }
+      // Case 3: Single file downloaded directly via Chrome Downloads API
+      else if (response.downloadId) {
+        setStatus(`Экспорт завершен: файл скачан`);
+      }
+      else {
+        setStatus('Экспорт завершен, но файл не был создан', true);
+      }
+      
+      if (mdExportInfo) {
+        mdExportInfo.classList.add('hidden');
+      }
+    } else {
+      setStatus(response?.error || 'Ошибка при экспорте в Markdown', true);
+      if (mdExportInfo) {
+        mdExportInfo.classList.add('hidden');
+      }
+    }
+  } catch (error) {
+    console.error('MD Export error:', error);
+    setStatus(`Ошибка экспорта: ${error.message}`, true);
+    if (mdExportInfo) {
+      mdExportInfo.classList.add('hidden');
+    }
+  }
 }
 
 // Load chats for selection
@@ -907,6 +1518,59 @@ function scrollToMonth(monthKey) {
   }, 1000);
 }
 
+// Scroll to specific month separator with smooth scrolling (for MD export)
+function scrollToMdMonth(monthKey) {
+  const monthSeparator = document.getElementById(`md-month-separator-${monthKey}`);
+  if (!monthSeparator || !mdChatsList) {
+    console.warn('scrollToMdMonth: separator or container not found', monthKey);
+    return;
+  }
+  
+  // Find all children of mdChatsList to calculate position
+  const children = Array.from(mdChatsList.children);
+  const separatorIndex = children.indexOf(monthSeparator);
+  
+  if (separatorIndex === -1) {
+    console.warn('scrollToMdMonth: separator not found in container children');
+    // Fallback to scrollIntoView
+    monthSeparator.scrollIntoView({
+      behavior: 'smooth',
+      block: 'start',
+      inline: 'nearest'
+    });
+    monthSeparator.classList.add('month-highlight');
+    setTimeout(() => {
+      monthSeparator.classList.remove('month-highlight');
+    }, 1000);
+    return;
+  }
+  
+  // Calculate total height of all elements before the separator
+  let totalHeight = 0;
+  for (let i = 0; i < separatorIndex; i++) {
+    const child = children[i];
+    const style = window.getComputedStyle(child);
+    const marginTop = parseFloat(style.marginTop) || 0;
+    const marginBottom = parseFloat(style.marginBottom) || 0;
+    totalHeight += child.offsetHeight + marginTop + marginBottom;
+  }
+  
+  // Scroll to calculated position with small offset
+  const offset = 4;
+  const targetScrollTop = Math.max(0, totalHeight - offset);
+  
+  mdChatsList.scrollTo({
+    top: targetScrollTop,
+    behavior: 'smooth'
+  });
+  
+  // Add highlight effect
+  monthSeparator.classList.add('month-highlight');
+  setTimeout(() => {
+    monthSeparator.classList.remove('month-highlight');
+  }, 1000);
+}
+
 // Update select all checkbox state
 function updateSelectAllState() {
   if (!selectAllChats) return;
@@ -946,6 +1610,12 @@ if (diagnosticsBtn) {
   diagnosticsBtn.addEventListener('click', async () => {
     if (!currentAccountEmail) {
       setStatus('Аккаунт не определен. Попробуйте импортировать базу данных или откройте страницу Copilot.', true);
+      return;
+    }
+    
+    // Toggle: если информация уже видна, скрыть её
+    if (diagnosticsInfo && !diagnosticsInfo.classList.contains('hidden')) {
+      diagnosticsInfo.classList.add('hidden');
       return;
     }
     
@@ -2140,7 +2810,35 @@ async function getAllAccounts() {
 async function initializeResetButtons() {
   if (!resetBtn) return;
   
+  // Check if database has data before creating buttons
+  const hasDataResult = await hasData();
+  if (!hasDataResult) {
+    // Hide reset button if no data
+    resetBtn.style.display = 'none';
+    // Remove old reset buttons if they exist
+    const resetBtnContainer = resetBtn.parentElement;
+    if (resetBtnContainer) {
+      const oldResetButtons = resetBtnContainer.querySelectorAll('.reset-btn-account');
+      oldResetButtons.forEach(btn => btn.remove());
+    }
+    return;
+  }
+  
   const accounts = await getAllAccounts();
+  // Filter out accounts with no indexed chats
+  const accountsWithData = accounts.filter(account => (account.chatCount || 0) > 0);
+  
+  // If no accounts with data, hide reset button
+  if (accountsWithData.length === 0) {
+    resetBtn.style.display = 'none';
+    const resetBtnContainer = resetBtn.parentElement;
+    if (resetBtnContainer) {
+      const oldResetButtons = resetBtnContainer.querySelectorAll('.reset-btn-account');
+      oldResetButtons.forEach(btn => btn.remove());
+    }
+    return;
+  }
+  
   const resetBtnContainer = resetBtn.parentElement;
   
   // Check if container exists
@@ -2153,11 +2851,11 @@ async function initializeResetButtons() {
   const oldResetButtons = resetBtnContainer.querySelectorAll('.reset-btn-account');
   oldResetButtons.forEach(btn => btn.remove());
   
-  if (accounts.length > 1) {
+  if (accountsWithData.length > 1) {
     // Hide original button for multiple accounts
     resetBtn.style.display = 'none';
-    // Create multiple buttons for each account
-    accounts.forEach(account => {
+    // Create multiple buttons for each account (only those with data)
+    accountsWithData.forEach(account => {
       const accountEmail = account.email;
       if (!accountEmail) return;
       
@@ -2224,8 +2922,8 @@ async function initializeResetButtons() {
     });
   } else {
     // Single account - show original button with tooltip
-    // Get account info for tooltip
-    const account = accounts.length > 0 ? accounts[0] : null;
+    // Get account info for tooltip (only if it has data)
+    const account = accountsWithData.length > 0 ? accountsWithData[0] : null;
     
     // Remove old handlers by cloning button to avoid duplicate handlers
     if (resetBtn.parentNode) {
@@ -2840,7 +3538,14 @@ function displaySearchResults(results) {
     collapseBtn.style.display = 'flex';
     collapseBtn.style.alignItems = 'center';
     collapseBtn.style.justifyContent = 'center';
-    collapseBtn.textContent = '▼';
+    // Проверяем начальное состояние свернутости из collapsedChats
+    const isInitiallyCollapsed = collapsedChats.has(chatId);
+    if (isInitiallyCollapsed) {
+      item.classList.add('collapsed');
+      collapseBtn.textContent = '▶';
+    } else {
+      collapseBtn.textContent = '▼';
+    }
     collapseBtn.style.transition = 'transform 0.2s';
     
     const title = document.createElement('div');

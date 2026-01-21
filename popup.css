@@ -1148,6 +1148,21 @@ body {
   background: #e3f2fd;
 }
 
+.modal-option-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.modal-option-disabled:hover {
+  border-color: #e6e6e6;
+  background: #fff;
+}
+
+.modal-option-disabled input[type="radio"] {
+  cursor: not-allowed;
+}
+
 .modal-option-label {
   flex: 1;
   display: flex;

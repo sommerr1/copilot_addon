@@ -2655,13 +2655,18 @@ async function getDatabaseDiagnostics(accountEmail) {
     request.onerror = () => reject(request.error);
   });
   
-  // Чаты по аккаунтам
+  // Чаты по аккаунтам (только аккаунты с данными)
   const chatsByAccount = {};
   let totalUniqueChats = 0;
+  const accountsWithData = [];
   for (const account of allAccounts) {
     const chats = await getChatsByAccount(account.email);
-    chatsByAccount[account.email] = chats.length;
-    totalUniqueChats += chats.length;
+    const chatCount = chats.length;
+    if (chatCount > 0) {
+      chatsByAccount[account.email] = chatCount;
+      totalUniqueChats += chatCount;
+      accountsWithData.push(account.email);
+    }
   }
   
   // Общее количество уникальных чатов (сумма по всем аккаунтам)
@@ -2672,8 +2677,8 @@ async function getDatabaseDiagnostics(accountEmail) {
     accountEmail,
     totalChats: allChatsCount, // Теперь это сумма уникальных чатов по всем аккаунтам
     accountChats: accountChats.length,
-    totalAccounts: allAccounts.length,
-    accounts: allAccounts.map(a => a.email),
+    totalAccounts: accountsWithData.length, // Только аккаунты с данными
+    accounts: accountsWithData, // Только аккаунты с данными
     chatsByAccount
   };
 }
@@ -4048,6 +4053,484 @@ async function checkHasData() {
   });
 }
 
+// ========== Markdown Export Functions ==========
+// Inline functions for Markdown export (to avoid import issues in service worker)
+
+/**
+ * Fallback HTML to Markdown conversion using regex (when DOMParser is unavailable)
+ */
+function convertHtmlToMarkdownFallback(html) {
+  if (!html || typeof html !== 'string') {
+    return '';
+  }
+
+  let markdown = html;
+
+  // Remove script and style tags with their content
+  markdown = markdown.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+  markdown = markdown.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+
+  // Remove unwanted elements
+  markdown = markdown.replace(/<img[^>]*>/gi, '');
+  markdown = markdown.replace(/<svg[^>]*>[\s\S]*?<\/svg>/gi, '');
+  markdown = markdown.replace(/<button[^>]*>[\s\S]*?<\/button>/gi, '');
+  markdown = markdown.replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '');
+  markdown = markdown.replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '');
+  markdown = markdown.replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '');
+
+  // Headers
+  markdown = markdown.replace(/<h1[^>]*>(.*?)<\/h1>/gi, '# $1\n\n');
+  markdown = markdown.replace(/<h2[^>]*>(.*?)<\/h2>/gi, '## $1\n\n');
+  markdown = markdown.replace(/<h3[^>]*>(.*?)<\/h3>/gi, '### $1\n\n');
+  markdown = markdown.replace(/<h4[^>]*>(.*?)<\/h4>/gi, '#### $1\n\n');
+  markdown = markdown.replace(/<h5[^>]*>(.*?)<\/h5>/gi, '##### $1\n\n');
+  markdown = markdown.replace(/<h6[^>]*>(.*?)<\/h6>/gi, '###### $1\n\n');
+
+  // Code blocks (pre with code)
+  markdown = markdown.replace(/<pre[^>]*><code[^>]*class="[^"]*language-(\w+)[^"]*"[^>]*>(.*?)<\/code><\/pre>/gis, '```$1\n$2\n```\n\n');
+  markdown = markdown.replace(/<pre[^>]*><code[^>]*>(.*?)<\/code><\/pre>/gis, '```\n$1\n```\n\n');
+  markdown = markdown.replace(/<pre[^>]*>(.*?)<\/pre>/gis, '```\n$1\n```\n\n');
+
+  // Inline code
+  markdown = markdown.replace(/<code[^>]*>(.*?)<\/code>/gi, '`$1`');
+
+  // Links
+  markdown = markdown.replace(/<a[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi, '[$2]($1)');
+
+  // Bold and italic
+  markdown = markdown.replace(/<(strong|b)[^>]*>(.*?)<\/\1>/gi, '**$2**');
+  markdown = markdown.replace(/<(em|i)[^>]*>(.*?)<\/\1>/gi, '*$2*');
+
+  // Lists
+  markdown = markdown.replace(/<ul[^>]*>/gi, '');
+  markdown = markdown.replace(/<\/ul>/gi, '\n');
+  markdown = markdown.replace(/<ol[^>]*>/gi, '');
+  markdown = markdown.replace(/<\/ol>/gi, '\n');
+  markdown = markdown.replace(/<li[^>]*>(.*?)<\/li>/gi, '- $1\n');
+
+  // Blockquote
+  markdown = markdown.replace(/<blockquote[^>]*>(.*?)<\/blockquote>/gis, (match, content) => {
+    return content.split('\n').map(line => line.trim() ? `> ${line.trim()}` : '').filter(l => l).join('\n') + '\n\n';
+  });
+
+  // Paragraphs
+  markdown = markdown.replace(/<p[^>]*>(.*?)<\/p>/gi, '$1\n\n');
+
+  // Line breaks
+  markdown = markdown.replace(/<br[^>]*\/?>/gi, '\n');
+  markdown = markdown.replace(/<hr[^>]*\/?>/gi, '---\n\n');
+
+  // Divs (convert to newlines, but preserve structure)
+  markdown = markdown.replace(/<div[^>]*>/gi, '');
+  markdown = markdown.replace(/<\/div>/gi, '\n');
+
+  // Remove remaining HTML tags
+  markdown = markdown.replace(/<[^>]+>/g, '');
+
+  // Decode HTML entities
+  markdown = markdown.replace(/&nbsp;/g, ' ');
+  markdown = markdown.replace(/&amp;/g, '&');
+  markdown = markdown.replace(/&lt;/g, '<');
+  markdown = markdown.replace(/&gt;/g, '>');
+  markdown = markdown.replace(/&quot;/g, '"');
+  markdown = markdown.replace(/&#39;/g, "'");
+
+  // Clean up whitespace
+  markdown = markdown.replace(/\n{3,}/g, '\n\n');
+  markdown = markdown.split('\n').map(line => line.trimEnd()).join('\n');
+  markdown = markdown.trim();
+
+  return markdown;
+}
+
+/**
+ * Convert HTML to Markdown format
+ */
+function convertHtmlToMarkdown(html) {
+  if (!html || typeof html !== 'string') {
+    return '';
+  }
+
+  // Check if DOMParser is available (may not be in some service worker contexts)
+  if (typeof DOMParser === 'undefined') {
+    // Fallback: simple regex-based conversion
+    return convertHtmlToMarkdownFallback(html);
+  }
+
+  let parser, doc, body;
+  try {
+    parser = new DOMParser();
+    doc = parser.parseFromString(html, 'text/html');
+    body = doc.body;
+  } catch (e) {
+    console.warn('DOMParser failed, using fallback:', e);
+    return convertHtmlToMarkdownFallback(html);
+  }
+
+  if (!body) {
+    return '';
+  }
+
+  // Remove UI elements
+  const selectorsToRemove = [
+    'img', '.sr-only', '[data-testid="sticky-header"]',
+    '[data-testid="date-divider"]', 'svg', 'button:not([data-content])',
+    'nav', 'header', 'footer'
+  ];
+  
+  selectorsToRemove.forEach(sel => {
+    try {
+      body.querySelectorAll(sel).forEach(el => el.remove());
+    } catch (e) {}
+  });
+
+  function nodeToMarkdown(node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      return node.textContent || '';
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return '';
+    }
+
+    const tagName = node.tagName?.toLowerCase();
+    const children = Array.from(node.childNodes);
+    const childText = children.map(child => nodeToMarkdown(child)).join('').trim();
+
+    if (!childText && !['img', 'br', 'hr'].includes(tagName)) {
+      return '';
+    }
+
+    switch (tagName) {
+      case 'h1': return `# ${childText}\n\n`;
+      case 'h2': return `## ${childText}\n\n`;
+      case 'h3': return `### ${childText}\n\n`;
+      case 'h4': return `#### ${childText}\n\n`;
+      case 'h5': return `##### ${childText}\n\n`;
+      case 'h6': return `###### ${childText}\n\n`;
+      case 'p': return `${childText}\n\n`;
+      case 'br': return '\n';
+      case 'hr': return '---\n\n';
+      case 'strong':
+      case 'b': return `**${childText}**`;
+      case 'em':
+      case 'i': return `*${childText}*`;
+      case 'code':
+        if (node.parentElement?.tagName?.toLowerCase() === 'pre') {
+          return childText;
+        }
+        return `\`${childText}\``;
+      case 'pre':
+        const codeContent = node.querySelector('code')?.textContent || childText;
+        const language = node.querySelector('code')?.className?.match(/language-(\w+)/)?.[1] || '';
+        return `\`\`\`${language}\n${codeContent}\n\`\`\`\n\n`;
+      case 'ul':
+      case 'ol':
+        return `${childText}\n`;
+      case 'li':
+        const parent = node.parentElement;
+        const isOrdered = parent?.tagName?.toLowerCase() === 'ol';
+        const index = Array.from(parent?.children || []).indexOf(node) + 1;
+        const prefix = isOrdered ? `${index}. ` : '- ';
+        const indent = node.closest('ul, ol') !== parent ? '  ' : '';
+        return `${indent}${prefix}${childText}\n`;
+      case 'a':
+        const href = node.getAttribute('href') || '';
+        const linkText = childText || href;
+        return href ? `[${linkText}](${href})` : linkText;
+      case 'blockquote':
+        return childText.split('\n').map(line => line.trim() ? `> ${line}` : '').join('\n') + '\n\n';
+      case 'div':
+        // Check if it's a Copilot separator (divider)
+        const classList = node.classList?.toString() || '';
+        if (classList.includes('relative') && classList.includes('pb-6') && 
+            classList.includes('w-full') && (classList.includes('after:border-b') || 
+            node.getAttribute('class')?.includes('after:border-b'))) {
+          return '---\n\n';
+        }
+        // Check if it's a code block wrapper
+        if (node.classList?.contains('code') || node.querySelector('pre, code')) {
+          return childText;
+        }
+        return childText;
+      default:
+        return childText;
+    }
+  }
+
+  let markdown = nodeToMarkdown(body).trim();
+  markdown = markdown.replace(/\n{3,}/g, '\n\n');
+  markdown = markdown.split('\n').map(line => line.trimEnd()).join('\n');
+
+  return markdown;
+}
+
+/**
+ * Format a chat message for Markdown export
+ */
+function formatMessageForMarkdown(message, htmlContent = null) {
+  const role = message.role || 'user';
+  const text = message.text || '';
+  const timestamp = message.timestampUTC ? new Date(message.timestampUTC).toLocaleString('ru-RU') : '';
+
+  let content = text;
+  if (htmlContent) {
+    content = convertHtmlToMarkdown(htmlContent);
+  }
+
+  if (role === 'user') {
+    return `## 👤 Пользователь${timestamp ? ` (${timestamp})` : ''}\n\n${content}\n\n`;
+  } else if (role === 'assistant') {
+    return `## 🤖 Copilot${timestamp ? ` (${timestamp})` : ''}\n\n${content}\n\n`;
+  } else {
+    return `## ${role}${timestamp ? ` (${timestamp})` : ''}\n\n${content}\n\n`;
+  }
+}
+
+/**
+ * Export multiple chats to Markdown files (fetching from Copilot server via content script)
+ */
+async function exportChatsToMarkdown(chatIds, accountEmail, getMessagesHtml = null) {
+  const results = [];
+  let reusableTab = null; // Переиспользуемая вкладка для оптимизации
+
+  for (let i = 0; i < chatIds.length; i++) {
+    const chatId = chatIds[i];
+    let tab = null;
+    let tabCreatedByUs = false;
+    
+    try {
+      const chat = await getChat(chatId);
+      if (!chat) {
+        console.warn(`Chat ${chatId} not found, skipping`);
+        continue;
+      }
+
+      // Ищем существующую вкладку с нужным URL
+      const tabs = await chrome.tabs.query({ url: chat.url });
+      if (tabs.length > 0) {
+        tab = tabs[0];
+        try {
+          const tabInfo = await chrome.tabs.get(tab.id);
+          if (tabInfo.status !== 'complete') {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        } catch (e) {
+          tab = null;
+        }
+      }
+      
+      // Если есть переиспользуемая вкладка - обновляем её URL
+      if (reusableTab && reusableTab.id) {
+        try {
+          const tabInfo = await chrome.tabs.get(reusableTab.id);
+          await chrome.tabs.update(reusableTab.id, { url: chat.url });
+          tab = reusableTab;
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          // Ждем загрузки страницы
+          let loadRetries = 7;
+          while (loadRetries > 0) {
+            try {
+              const updatedTabInfo = await chrome.tabs.get(tab.id);
+              if (updatedTabInfo.status === 'complete' && updatedTabInfo.url === chat.url) {
+                break;
+              }
+              await new Promise(resolve => setTimeout(resolve, 300));
+            } catch (e) {
+              throw new Error('Tab was closed during loading');
+            }
+            loadRetries--;
+          }
+        } catch (e) {
+          console.warn(`Could not reuse tab, creating new one:`, e.message);
+          tab = null;
+        }
+      }
+      
+      // Если вкладки нет, ищем существующие вкладки Copilot
+      if (!tab) {
+        const copilotTabs = await chrome.tabs.query({ url: "*://copilot.microsoft.com/*" });
+        if (copilotTabs.length > 0) {
+          tab = copilotTabs[0];
+          await chrome.tabs.update(tab.id, { url: chat.url });
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          let loadRetries = 7;
+          while (loadRetries > 0) {
+            try {
+              const tabInfo = await chrome.tabs.get(tab.id);
+              if (tabInfo.status === 'complete' && tabInfo.url === chat.url) {
+                break;
+              }
+              await new Promise(resolve => setTimeout(resolve, 300));
+            } catch (e) {
+              throw new Error('Tab was closed during loading');
+            }
+            loadRetries--;
+          }
+        } else {
+          // Создаем новую вкладку
+          tab = await chrome.tabs.create({ 
+            url: chat.url, 
+            active: false,
+            pinned: false
+          });
+          tabCreatedByUs = true;
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          
+          let loadRetries = 7;
+          while (loadRetries > 0) {
+            try {
+              const tabInfo = await chrome.tabs.get(tab.id);
+              if (tabInfo.status === 'complete') {
+                break;
+              }
+              await new Promise(resolve => setTimeout(resolve, 300));
+            } catch (e) {
+              throw new Error('Tab was closed during loading');
+            }
+            loadRetries--;
+          }
+        }
+      }
+      
+      // Сохраняем вкладку для переиспользования
+      if (tab && !reusableTab) {
+        reusableTab = tab;
+      }
+      
+      // Ждем загрузки content script
+      await new Promise(resolve => setTimeout(resolve, 2500));
+      
+      // Получаем сообщения с HTML через content script
+      let maxAttempts = 15;
+      const waitDelay = 500;
+      let messages = null;
+      
+      while (maxAttempts > 0) {
+        try {
+          const response = await chrome.tabs.sendMessage(tab.id, { 
+            action: 'getChatContentWithHtml',
+            chatId: chatId 
+          });
+          
+          if (response && response.success && response.messages && response.messages.length > 0) {
+            messages = response.messages;
+            console.log(`exportChatsToMarkdown: Retrieved ${messages.length} messages for chat ${chatId}`);
+            break;
+          } else {
+            console.log(`exportChatsToMarkdown: Messages not ready yet, waiting... (${maxAttempts} attempts left)`);
+            await new Promise(resolve => setTimeout(resolve, waitDelay));
+          }
+        } catch (error) {
+          const errorMsg = error.message || String(error);
+          if (errorMsg.includes('Could not establish connection') || errorMsg.includes('Receiving end does not exist')) {
+            console.log(`exportChatsToMarkdown: Content script not ready, waiting... (${maxAttempts} attempts left)`);
+            await new Promise(resolve => setTimeout(resolve, waitDelay));
+          } else {
+            throw error;
+          }
+        }
+        maxAttempts--;
+      }
+      
+      if (!messages || messages.length === 0) {
+        console.warn(`No messages retrieved for chat ${chatId}, skipping`);
+        continue;
+      }
+      
+      // Сортируем сообщения по порядку в DOM или по времени
+      messages.sort((a, b) => {
+        if (a.domOrder !== undefined && b.domOrder !== undefined) {
+          return a.domOrder - b.domOrder;
+        }
+        return new Date(a.timestampUTC) - new Date(b.timestampUTC);
+      });
+
+      // Build markdown content
+      let markdown = `# ${chat.title || 'Безымянный чат'}\n\n`;
+      
+      if (chat.url) {
+        markdown += `**Ссылка:** [${chat.url}](${chat.url})\n\n`;
+      }
+      
+      if (chat.updatedAtUTC) {
+        const date = new Date(chat.updatedAtUTC).toLocaleString('ru-RU');
+        markdown += `**Дата обновления:** ${date}\n\n`;
+      }
+      
+      markdown += '---\n\n';
+
+      // Export messages with HTML content
+      for (const message of messages) {
+        const htmlContent = message.html || null;
+        markdown += formatMessageForMarkdown(message, htmlContent);
+      }
+
+      // Create filename from chat title
+      const title = chat.title || 'Безымянный_чат';
+      const sanitizedTitle = title
+        .replace(/[<>:"/\\|?*]/g, '_')
+        .replace(/\s+/g, '_')
+        .substring(0, 100);
+      const filename = `${sanitizedTitle}_${chatId.substring(0, 8)}.md`;
+
+      results.push({
+        chatId,
+        filename,
+        content: markdown,
+        title: chat.title
+      });
+      
+      // Закрываем вкладку, если она была создана нами (кроме последнего чата)
+      if (tabCreatedByUs && tab && tab.id && i < chatIds.length - 1) {
+        try {
+          await chrome.tabs.remove(tab.id);
+        } catch (e) {
+          // Игнорируем ошибки закрытия
+        }
+        tabCreatedByUs = false;
+        if (reusableTab && reusableTab.id === tab.id) {
+          reusableTab = null;
+        }
+      }
+      
+    } catch (error) {
+      console.error(`Error exporting chat ${chatId}:`, error);
+      results.push({
+        chatId,
+        filename: null,
+        content: null,
+        error: error.message
+      });
+      
+      // Закрываем вкладку при ошибке, если она была создана нами
+      if (tabCreatedByUs && tab && tab.id) {
+        try {
+          await chrome.tabs.remove(tab.id);
+        } catch (e) {
+          // Игнорируем ошибки
+        }
+        if (reusableTab && reusableTab.id === tab.id) {
+          reusableTab = null;
+        }
+      }
+    }
+  }
+  
+  // Закрываем переиспользуемую вкладку в конце
+  if (reusableTab && reusableTab.id) {
+    try {
+      await chrome.tabs.remove(reusableTab.id);
+    } catch (e) {
+      // Игнорируем ошибки
+    }
+  }
+
+  return results;
+}
+
 // ========== Message Handlers ==========
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'START_INDEXING') {
@@ -4774,7 +5257,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           };
         }));
         
-        sendResponse({ success: true, accounts: accountsWithChats });
+        // Фильтруем только аккаунты с индексированными чатами (chatCount > 0)
+        const accountsWithData = accountsWithChats.filter(account => account.chatCount > 0);
+        
+        sendResponse({ success: true, accounts: accountsWithData });
       } catch (error) {
         sendResponse({ success: false, error: error.message });
       }
@@ -4815,6 +5301,68 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({ success: false, error: error.message });
       }
     })();
+    return true;
+  }
+  
+  if (request.type === 'EXPORT_TO_MARKDOWN') {
+    const { accountEmail, chatIds } = request;
+    
+    (async () => {
+      try {
+        // Export chats to Markdown (fetching from Copilot server via content script)
+        // getMessagesHtml parameter is not needed anymore - we get HTML directly from page
+        const results = await exportChatsToMarkdown(chatIds, accountEmail, null);
+        
+        if (results.length === 0) {
+          sendResponse({ success: false, error: 'Нет данных для экспорта' });
+          return;
+        }
+        
+        // Prepare files for ZIP creation (always send to popup.js for ZIP creation)
+        const zipFiles = results
+          .filter(r => r.content)
+          .map(r => ({
+            filename: r.filename,
+            content: r.content
+          }));
+        
+        if (zipFiles.length === 0) {
+          sendResponse({ success: false, error: 'Не удалось создать файлы для экспорта' });
+          return;
+        }
+        
+        // If only one file, we can download it directly via Chrome Downloads API
+        if (zipFiles.length === 1) {
+          const file = zipFiles[0];
+          // For single file, we'll send it to popup for download (simpler)
+          sendResponse({ 
+            success: true, 
+            files: zipFiles,
+            needsZipCreation: false, // Single file, no ZIP needed
+            filename: file.filename,
+            fileCount: 1
+          });
+          return;
+        }
+        
+        // Multiple files - need to create ZIP in popup.js
+        const sanitizedAccount = accountEmail.replace(/[^a-zA-Z0-9]/g, '_');
+        const dateStr = new Date().toISOString().split('T')[0];
+        const zipFilename = `copilot_chats_export_${sanitizedAccount}_${dateStr}.zip`;
+        
+        sendResponse({ 
+          success: true, 
+          files: zipFiles,
+          needsZipCreation: true,
+          filename: zipFilename,
+          fileCount: zipFiles.length
+        });
+      } catch (error) {
+        console.error('Export to Markdown error:', error);
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    
     return true;
   }
   

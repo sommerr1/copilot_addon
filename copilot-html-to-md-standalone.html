@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Copilot HTML → Markdown Converter</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            background: #f8f9ff;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-bottom: 20px;
+        }
+        
+        .upload-area:hover {
+            border-color: #764ba2;
+            background: #f0f2ff;
+        }
+        
+        .upload-area.dragover {
+            border-color: #764ba2;
+            background: #e8ebff;
+            transform: scale(1.02);
+        }
+        
+        .upload-icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+        
+        .file-input {
+            display: none;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: transform 0.2s;
+            margin: 10px 5px;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn:active {
+            transform: translateY(0);
+        }
+        
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .btn-secondary {
+            background: #6c757d;
+        }
+        
+        .preview-area {
+            margin-top: 20px;
+            display: none;
+        }
+        
+        .preview-area.active {
+            display: block;
+        }
+        
+        .preview-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .preview-header h3 {
+            color: #333;
+        }
+        
+        .preview-content {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+        
+        .status {
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+            display: block;
+        }
+        
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+            display: block;
+        }
+        
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+            display: block;
+        }
+        
+        .file-info {
+            background: #e9ecef;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            display: none;
+        }
+        
+        .file-info.active {
+            display: block;
+        }
+        
+        .file-info strong {
+            color: #667eea;
+        }
+        
+        .actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔄 Copilot HTML → Markdown Converter</h1>
+            <p>Конвертируйте сохраненные HTML-файлы Copilot в формат Markdown для Obsidian</p>
+        </div>
+        
+        <div class="content">
+            <div id="status" class="status"></div>
+            
+            <div id="fileInfo" class="file-info">
+                <strong>Файл:</strong> <span id="fileName"></span><br>
+                <strong>Размер:</strong> <span id="fileSize"></span>
+            </div>
+            
+            <div class="upload-area" id="uploadArea">
+                <div class="upload-icon">📄</div>
+                <h3>Перетащите HTML-файл сюда</h3>
+                <p>или нажмите для выбора файла</p>
+                <input type="file" id="fileInput" class="file-input" accept=".html,.htm">
+            </div>
+            
+            <div class="actions">
+                <button id="convertBtn" class="btn" disabled>Конвертировать в Markdown</button>
+                <button id="downloadBtn" class="btn btn-secondary" disabled>Скачать .md файл</button>
+                <button id="clearBtn" class="btn btn-secondary" disabled>Очистить</button>
+            </div>
+            
+            <div id="previewArea" class="preview-area">
+                <div class="preview-header">
+                    <h3>Предпросмотр Markdown</h3>
+                    <button id="copyBtn" class="btn btn-secondary">Копировать</button>
+                </div>
+                <div id="previewContent" class="preview-content"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ============================================
+        // Встроенные функции конвертации
+        // ============================================
+
+        /**
+         * Convert HTML to Markdown format
+         */
+        function convertHtmlToMarkdown(html) {
+            if (!html || typeof html !== 'string') {
+                return '';
+            }
+
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            const body = doc.body;
+
+            if (!body) {
+                return '';
+            }
+
+            // Remove UI elements
+            const selectorsToRemove = [
+                'img', '.sr-only', '[data-testid="sticky-header"]',
+                '[data-testid="date-divider"]', 'svg', 'button:not([data-content])',
+                'nav', 'header', 'footer'
+            ];
+            
+            selectorsToRemove.forEach(sel => {
+                try {
+                    body.querySelectorAll(sel).forEach(el => el.remove());
+                } catch (e) {}
+            });
+
+            function nodeToMarkdown(node) {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    return node.textContent || '';
+                }
+
+                if (node.nodeType !== Node.ELEMENT_NODE) {
+                    return '';
+                }
+
+                const tagName = node.tagName?.toLowerCase();
+                const children = Array.from(node.childNodes);
+                const childText = children.map(child => nodeToMarkdown(child)).join('').trim();
+
+                if (!childText && !['img', 'br', 'hr'].includes(tagName)) {
+                    return '';
+                }
+
+                switch (tagName) {
+                    case 'h1': return `# ${childText}\n\n`;
+                    case 'h2': return `## ${childText}\n\n`;
+                    case 'h3': return `### ${childText}\n\n`;
+                    case 'h4': return `#### ${childText}\n\n`;
+                    case 'h5': return `##### ${childText}\n\n`;
+                    case 'h6': return `###### ${childText}\n\n`;
+                    case 'p': return `${childText}\n\n`;
+                    case 'br': return '\n';
+                    case 'hr': return '---\n\n';
+                    case 'strong':
+                    case 'b': return `**${childText}**`;
+                    case 'em':
+                    case 'i': return `*${childText}*`;
+                    case 'code':
+                        if (node.parentElement?.tagName?.toLowerCase() === 'pre') {
+                            return childText;
+                        }
+                        return `\`${childText}\``;
+                    case 'pre':
+                        const codeContent = node.querySelector('code')?.textContent || childText;
+                        const language = node.querySelector('code')?.className?.match(/language-(\w+)/)?.[1] || '';
+                        return `\`\`\`${language}\n${codeContent}\n\`\`\`\n\n`;
+                    case 'ul':
+                    case 'ol':
+                        return `${childText}\n`;
+                    case 'li':
+                        const parent = node.parentElement;
+                        const isOrdered = parent?.tagName?.toLowerCase() === 'ol';
+                        const index = Array.from(parent?.children || []).indexOf(node) + 1;
+                        const prefix = isOrdered ? `${index}. ` : '- ';
+                        const indent = node.closest('ul, ol') !== parent ? '  ' : '';
+                        return `${indent}${prefix}${childText}\n`;
+                    case 'a':
+                        const href = node.getAttribute('href') || '';
+                        const linkText = childText || href;
+                        return href ? `[${linkText}](${href})` : linkText;
+                    case 'blockquote':
+                        return childText.split('\n').map(line => line.trim() ? `> ${line}` : '').join('\n') + '\n\n';
+                    case 'div':
+                        // Check if it's a Copilot separator (divider)
+                        const classList = node.classList?.toString() || '';
+                        if (classList.includes('relative') && classList.includes('pb-6') && 
+                            classList.includes('w-full') && (classList.includes('after:border-b') || 
+                            node.getAttribute('class')?.includes('after:border-b'))) {
+                            return '---\n\n';
+                        }
+                        // Check if it's a code block wrapper
+                        if (node.classList?.contains('code') || node.querySelector('pre, code')) {
+                            return childText;
+                        }
+                        return childText;
+                    default:
+                        return childText;
+                }
+            }
+
+            let markdown = nodeToMarkdown(body).trim();
+            markdown = markdown.replace(/\n{3,}/g, '\n\n');
+            markdown = markdown.split('\n').map(line => line.trimEnd()).join('\n');
+
+            return markdown;
+        }
+
+        /**
+         * Convert full Copilot HTML file to Markdown for Obsidian
+         */
+        function convertCopilotHtmlFileToMarkdown(htmlContent) {
+            if (!htmlContent || typeof htmlContent !== 'string') {
+                return '';
+            }
+
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(htmlContent, 'text/html');
+            const body = doc.body;
+
+            if (!body) {
+                return '';
+            }
+
+            // Remove UI elements
+            const selectorsToRemove = [
+                'img', '.sr-only', '[data-testid="sticky-header"]',
+                '[data-testid="date-divider"]', 'svg', 'button:not([data-content])',
+                'nav', 'header', 'footer', '[data-testid="message-item-reactions"]',
+                '[aria-hidden="true"]', '.hidden', '[style*="display: none"]',
+                'script', 'style'
+            ];
+            
+            selectorsToRemove.forEach(sel => {
+                try {
+                    body.querySelectorAll(sel).forEach(el => el.remove());
+                } catch (e) {}
+            });
+
+            // Extract messages in order
+            const messages = [];
+            const messageElements = body.querySelectorAll('[role="article"]');
+
+            for (const msgEl of messageElements) {
+                const isUser = msgEl.querySelector('[data-content="user-message"]') || 
+                               msgEl.getAttribute('aria-labelledby')?.includes('user-message') ||
+                               msgEl.querySelector('[data-testid*="user-message"]') ||
+                               msgEl.classList.toString().includes('user-message');
+                
+                const isAssistant = msgEl.querySelector('[data-content="ai-message"]') ||
+                                    msgEl.getAttribute('aria-labelledby')?.includes('ai-message') ||
+                                    msgEl.getAttribute('aria-labelledby')?.includes('author') ||
+                                    msgEl.querySelector('[data-testid*="ai-message"]') ||
+                                    msgEl.classList.toString().includes('ai-message') ||
+                                    msgEl.classList.toString().includes('assistant-message');
+                
+                if (!isUser && !isAssistant) {
+                    continue;
+                }
+
+                let contentElement = msgEl;
+                if (isAssistant) {
+                    const contentContainer = msgEl.querySelector('[data-content="ai-message"]') || 
+                                            msgEl.querySelector('[class*="message-content"]') ||
+                                            msgEl.querySelector('[class*="response-content"]') ||
+                                            msgEl.querySelector('[class*="ai-message-item"]') ||
+                                            msgEl;
+                    contentElement = contentContainer;
+                }
+
+                const html = contentElement.innerHTML || '';
+                const text = contentElement.textContent?.trim() || '';
+                
+                if (text.length > 0) {
+                    const timeEl = msgEl.querySelector('time') || 
+                                  msgEl.querySelector('[data-testid*="date"]') ||
+                                  msgEl.closest('[role="article"]')?.querySelector('time');
+                    const timestamp = timeEl ? (timeEl.getAttribute('datetime') || timeEl.textContent) : null;
+                    
+                    messages.push({
+                        role: isUser ? 'user' : 'assistant',
+                        html: html,
+                        text: text,
+                        timestamp: timestamp,
+                        domOrder: Array.from(messageElements).indexOf(msgEl)
+                    });
+                }
+            }
+
+            // If no messages found via role="article", try alternative selectors
+            if (messages.length === 0) {
+                const userMessages = body.querySelectorAll('[data-content="user-message"]');
+                const aiMessages = body.querySelectorAll('[data-content="ai-message"]');
+                
+                const allElements = [];
+                userMessages.forEach(el => allElements.push({ el, role: 'user' }));
+                aiMessages.forEach(el => allElements.push({ el, role: 'assistant' }));
+                
+                allElements.sort((a, b) => {
+                    const posA = Array.from(body.querySelectorAll('*')).indexOf(a.el);
+                    const posB = Array.from(body.querySelectorAll('*')).indexOf(b.el);
+                    return posA - posB;
+                });
+
+                allElements.forEach(({ el, role }) => {
+                    const html = el.innerHTML || '';
+                    const text = el.textContent?.trim() || '';
+                    if (text.length > 0) {
+                        messages.push({
+                            role: role,
+                            html: html,
+                            text: text,
+                            timestamp: null,
+                            domOrder: Array.from(body.querySelectorAll('*')).indexOf(el)
+                        });
+                    }
+                });
+            }
+
+            messages.sort((a, b) => a.domOrder - b.domOrder);
+
+            let markdown = '# Диалог Copilot\n\n';
+            markdown += `**Дата конвертации:** ${new Date().toLocaleString('ru-RU')}\n\n`;
+            markdown += '---\n\n';
+
+            for (const message of messages) {
+                const role = message.role;
+                const content = convertHtmlToMarkdown(message.html || message.text);
+                
+                if (role === 'user') {
+                    markdown += `## 👤 Пользователь${message.timestamp ? ` (${message.timestamp})` : ''}\n\n${content}\n\n`;
+                } else if (role === 'assistant') {
+                    markdown += `## 🤖 Copilot${message.timestamp ? ` (${message.timestamp})` : ''}\n\n${content}\n\n`;
+                }
+            }
+
+            markdown = markdown.replace(/\n{3,}/g, '\n\n');
+            markdown = markdown.split('\n').map(line => line.trimEnd()).join('\n');
+
+            return markdown.trim();
+        }
+
+        // ============================================
+        // UI Logic
+        // ============================================
+
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const convertBtn = document.getElementById('convertBtn');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const clearBtn = document.getElementById('clearBtn');
+        const copyBtn = document.getElementById('copyBtn');
+        const previewArea = document.getElementById('previewArea');
+        const previewContent = document.getElementById('previewContent');
+        const status = document.getElementById('status');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const fileSize = document.getElementById('fileSize');
+
+        let currentMarkdown = '';
+        let currentFileName = '';
+
+        function showStatus(message, type = 'info') {
+            status.className = `status ${type}`;
+            status.textContent = message;
+            setTimeout(() => {
+                status.style.display = 'none';
+            }, 5000);
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes === 0) return '0 Bytes';
+            const k = 1024;
+            const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+        }
+
+        function handleFile(file) {
+            if (!file) return;
+            
+            if (!file.name.toLowerCase().endsWith('.html') && !file.name.toLowerCase().endsWith('.htm')) {
+                showStatus('Пожалуйста, выберите HTML-файл', 'error');
+                return;
+            }
+
+            currentFileName = file.name;
+            fileName.textContent = file.name;
+            fileSize.textContent = formatFileSize(file.size);
+            fileInfo.classList.add('active');
+            
+            convertBtn.disabled = false;
+            clearBtn.disabled = false;
+            showStatus('Файл загружен. Нажмите "Конвертировать в Markdown"', 'success');
+        }
+
+        function readFile(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => resolve(e.target.result);
+                reader.onerror = (e) => reject(e);
+                reader.readAsText(file, 'UTF-8');
+            });
+        }
+
+        uploadArea.addEventListener('click', () => {
+            fileInput.click();
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            handleFile(file);
+        });
+
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            handleFile(file);
+            fileInput.files = e.dataTransfer.files;
+        });
+
+        convertBtn.addEventListener('click', async () => {
+            const file = fileInput.files[0];
+            if (!file) {
+                showStatus('Пожалуйста, выберите файл', 'error');
+                return;
+            }
+
+            convertBtn.disabled = true;
+            showStatus('Конвертация...', 'info');
+
+            try {
+                const htmlContent = await readFile(file);
+                currentMarkdown = convertCopilotHtmlFileToMarkdown(htmlContent);
+                
+                previewContent.textContent = currentMarkdown;
+                previewArea.classList.add('active');
+                downloadBtn.disabled = false;
+                copyBtn.disabled = false;
+                
+                showStatus('Конвертация завершена успешно!', 'success');
+            } catch (error) {
+                showStatus('Ошибка при конвертации: ' + error.message, 'error');
+                console.error(error);
+            } finally {
+                convertBtn.disabled = false;
+            }
+        });
+
+        downloadBtn.addEventListener('click', () => {
+            if (!currentMarkdown) {
+                showStatus('Нет данных для скачивания', 'error');
+                return;
+            }
+
+            const blob = new Blob([currentMarkdown], { type: 'text/markdown;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = currentFileName.replace(/\.html?$/i, '.md');
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            showStatus('Файл скачан успешно!', 'success');
+        });
+
+        copyBtn.addEventListener('click', async () => {
+            if (!currentMarkdown) {
+                showStatus('Нет данных для копирования', 'error');
+                return;
+            }
+
+            try {
+                await navigator.clipboard.writeText(currentMarkdown);
+                showStatus('Скопировано в буфер обмена!', 'success');
+            } catch (error) {
+                showStatus('Ошибка при копировании: ' + error.message, 'error');
+            }
+        });
+
+        clearBtn.addEventListener('click', () => {
+            fileInput.value = '';
+            currentMarkdown = '';
+            currentFileName = '';
+            previewArea.classList.remove('active');
+            fileInfo.classList.remove('active');
+            convertBtn.disabled = true;
+            downloadBtn.disabled = true;
+            copyBtn.disabled = true;
+            showStatus('Очищено', 'info');
+        });
+    </script>
+</body>
+</html>
