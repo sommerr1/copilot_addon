@@ -43,6 +43,36 @@ body {
   font-size: 12px;
 }
 
+.toolbar__refresh-btn {
+  border: none;
+  background: transparent;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #666;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.toolbar__refresh-btn:hover {
+  background: #e8e8e8;
+  color: #1a66d4;
+}
+
+.toolbar__refresh-btn:active {
+  transform: rotate(180deg);
+  transition: transform 0.3s ease;
+}
+
+.toolbar__refresh-btn svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
 .requests {
   max-height: 240px;
   overflow: auto;
@@ -374,6 +404,19 @@ body {
   white-space: nowrap;
 }
 
+.search-accounts-legend label {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.search-accounts-legend input[type="checkbox"] {
+  cursor: pointer;
+  margin: 0;
+  padding: 0;
+}
+
 /* Заголовок чата */
 .search-result-title-row {
   user-select: none;
@@ -426,11 +469,6 @@ body {
 
 .search-result-title:hover {
   color: #0d47a1;
-}
-
-/* Пастельный фон для заголовка при наличии нескольких аккаунтов */
-.search-result-title[style*="background-color"] {
-  border: 1px solid rgba(0, 0, 0, 0.1);
 }
 
 .search-result-snippets {

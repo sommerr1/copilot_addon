@@ -40,6 +40,10 @@ let selectedChatIds = new Set();
 let chatCheckboxes = new Map();
 let collapsedChats = new Set(); // Для отслеживания свернутых чатов
 let allChatsCollapsed = false; // Состояние "свернуть все"
+let selectedAccountsForSearch = new Set(); // Выбранные аккаунты для поиска
+let allSearchResults = []; // Все результаты поиска (до фильтрации)
+let currentAccountColorMap = new Map(); // Карта цветов аккаунтов для текущего поиска
+let currentUniqueAccounts = new Set(); // Уникальные аккаунты для текущего поиска
 
 // UI Elements
 const tabIndex = document.getElementById('tabIndex');
@@ -400,6 +404,16 @@ if (clearRequestsBtn) {
     }
     currentRequests = [];
     renderRequests();
+  });
+}
+
+// Refresh extension button
+const refreshExtensionBtn = document.getElementById('refreshExtensionBtn');
+if (refreshExtensionBtn) {
+  refreshExtensionBtn.addEventListener('click', () => {
+    if (confirm('Перезагрузить расширение до последней версии?')) {
+      chrome.runtime.reload();
+    }
   });
 }
 
@@ -2515,8 +2529,16 @@ function displaySearchResults(results) {
     searchResults.innerHTML = '';
     searchEmpty.style.display = 'block';
     searchEmpty.textContent = 'Результаты не найдены';
+    allSearchResults = [];
+    selectedAccountsForSearch.clear();
     return;
   }
+  
+  // Сохраняем все результаты для фильтрации
+  allSearchResults = results;
+  
+  // Сбрасываем выбранные аккаунты при новом поиске
+  selectedAccountsForSearch.clear();
   
   searchEmpty.style.display = 'none';
   searchResults.innerHTML = '';
@@ -2537,11 +2559,45 @@ function displaySearchResults(results) {
     }
   });
   
+  // Подсчитываем количество чатов для каждого аккаунта
+  const accountChatCounts = new Map();
+  const uniqueChatsByAccount = new Map();
+  results.forEach(result => {
+    if (result.accountEmail) {
+      if (!uniqueChatsByAccount.has(result.accountEmail)) {
+        uniqueChatsByAccount.set(result.accountEmail, new Set());
+      }
+      if (result.chatId) {
+        uniqueChatsByAccount.get(result.accountEmail).add(result.chatId);
+      }
+    }
+  });
+  uniqueChatsByAccount.forEach((chats, email) => {
+    accountChatCounts.set(email, chats.size);
+  });
+  
+  // Инициализируем выбранные аккаунты (по умолчанию все включены)
+  if (selectedAccountsForSearch.size === 0) {
+    uniqueAccounts.forEach(email => {
+      selectedAccountsForSearch.add(email);
+    });
+  }
+  
+  // Фильтруем результаты по выбранным аккаунтам
+  const filteredResults = results.filter(result => {
+    if (!result.accountEmail) return true;
+    return selectedAccountsForSearch.has(result.accountEmail);
+  });
+  
   // Создаем карту цветов для аккаунтов
   const accountColorMap = new Map();
   uniqueAccounts.forEach(email => {
     accountColorMap.set(email, getPastelColorForAccount(email));
   });
+  
+  // Сохраняем для использования в других функциях
+  currentAccountColorMap = accountColorMap;
+  currentUniqueAccounts = uniqueAccounts;
   
   // Заголовок с кнопкой "Свернуть все/Развернуть все"
   const resultsHeader = document.createElement('div');
@@ -2565,7 +2621,7 @@ function displaySearchResults(results) {
   resultsCount.className = 'search-results-count';
   resultsCount.style.fontSize = '12px';
   resultsCount.style.color = '#666';
-  resultsCount.textContent = `Найдено чатов: ${results.length}`;
+  resultsCount.textContent = `Найдено чатов: ${filteredResults.length}`;
   
   headerLeft.appendChild(resultsCount);
   
@@ -2585,6 +2641,14 @@ function displaySearchResults(results) {
       legendItem.style.alignItems = 'center';
       legendItem.style.gap = '4px';
       
+      // Создаем контейнер для кубика с чекбоксом
+      const colorBoxContainer = document.createElement('label');
+      colorBoxContainer.style.position = 'relative';
+      colorBoxContainer.style.cursor = 'pointer';
+      colorBoxContainer.style.display = 'flex';
+      colorBoxContainer.style.alignItems = 'center';
+      colorBoxContainer.style.justifyContent = 'center';
+      
       const colorBox = document.createElement('span');
       colorBox.style.width = '12px';
       colorBox.style.height = '12px';
@@ -2592,14 +2656,77 @@ function displaySearchResults(results) {
       colorBox.style.backgroundColor = accountColorMap.get(email);
       colorBox.style.border = '1px solid rgba(0,0,0,0.1)';
       colorBox.style.flexShrink = '0';
+      colorBox.style.display = 'flex';
+      colorBox.style.alignItems = 'center';
+      colorBox.style.justifyContent = 'center';
+      colorBox.style.position = 'relative';
+      
+      // Создаем скрытый чекбокс для функциональности
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = selectedAccountsForSearch.has(email);
+      checkbox.style.position = 'absolute';
+      checkbox.style.opacity = '0';
+      checkbox.style.width = '12px';
+      checkbox.style.height = '12px';
+      checkbox.style.margin = '0';
+      checkbox.style.cursor = 'pointer';
+      checkbox.style.zIndex = '1';
+      
+      // Создаем визуальную галочку
+      const checkmark = document.createElement('span');
+      checkmark.style.display = checkbox.checked ? 'block' : 'none';
+      checkmark.style.position = 'absolute';
+      checkmark.style.width = '8px';
+      checkmark.style.height = '8px';
+      checkmark.style.color = '#1a66d4';
+      checkmark.style.fontSize = '10px';
+      checkmark.style.fontWeight = 'bold';
+      checkmark.style.lineHeight = '1';
+      checkmark.style.zIndex = '2';
+      checkmark.style.pointerEvents = 'none';
+      checkmark.textContent = '✓';
+      checkmark.style.textShadow = '0 0 1px rgba(255,255,255,0.8)';
+      
+      // Функция обновления визуального состояния
+      const updateCheckboxVisual = () => {
+        if (checkbox.checked) {
+          checkmark.style.display = 'block';
+          colorBox.style.opacity = '1';
+        } else {
+          checkmark.style.display = 'none';
+          colorBox.style.opacity = '0.5';
+        }
+      };
+      
+      // Обработчик изменения чекбокса
+      checkbox.addEventListener('change', (e) => {
+        e.stopPropagation();
+        if (checkbox.checked) {
+          selectedAccountsForSearch.add(email);
+        } else {
+          selectedAccountsForSearch.delete(email);
+        }
+        updateCheckboxVisual();
+        // Перерисовываем результаты с учетом фильтрации
+        renderFilteredResults();
+      });
+      
+      // Инициализируем визуальное состояние
+      updateCheckboxVisual();
+      
+      colorBox.appendChild(checkbox);
+      colorBox.appendChild(checkmark);
+      colorBoxContainer.appendChild(colorBox);
       
       const emailLabel = document.createElement('span');
       emailLabel.style.color = '#666';
-      // Показываем короткий email (до @ или первые 15 символов)
+      // Показываем короткий email (до @ или первые 15 символов) и количество чатов
       const shortEmail = email.includes('@') ? email.split('@')[0] : email.substring(0, 15);
-      emailLabel.textContent = shortEmail;
+      const chatCount = accountChatCounts.get(email) || 0;
+      emailLabel.textContent = `${shortEmail} = ${chatCount}`;
       
-      legendItem.appendChild(colorBox);
+      legendItem.appendChild(colorBoxContainer);
       legendItem.appendChild(emailLabel);
       legendContainer.appendChild(legendItem);
     });
@@ -2621,7 +2748,7 @@ function displaySearchResults(results) {
   toggleAllBtn.textContent = 'Свернуть все';
   toggleAllBtn.addEventListener('click', (e) => {
     e.stopPropagation();
-    toggleAllChats(results);
+    toggleAllChats(filteredResults);
   });
   
   resultsHeader.appendChild(headerLeft);
@@ -2629,13 +2756,13 @@ function displaySearchResults(results) {
   searchResults.appendChild(resultsHeader);
   
   // Функция для переключения состояния всех чатов
-  function toggleAllChats(results) {
+  function toggleAllChats(resultsToToggle) {
     allChatsCollapsed = !allChatsCollapsed;
     toggleAllBtn.textContent = allChatsCollapsed ? 'Развернуть все' : 'Свернуть все';
     
     const items = searchResults.querySelectorAll('.search-result-item');
     items.forEach((item, index) => {
-      const chatId = results[index]?.chatId || index;
+      const chatId = resultsToToggle[index]?.chatId || index;
       const collapseBtn = item.querySelector('.search-collapse-btn');
       
       if (allChatsCollapsed) {
@@ -2654,8 +2781,31 @@ function displaySearchResults(results) {
     });
   }
   
-  for (let i = 0; i < results.length; i++) {
-    const result = results[i];
+  // Функция для перерисовки отфильтрованных результатов
+  function renderFilteredResults() {
+    const filtered = allSearchResults.filter(result => {
+      if (!result.accountEmail) return true;
+      return selectedAccountsForSearch.has(result.accountEmail);
+    });
+    
+    // Обновляем счетчик
+    if (resultsCount) {
+      resultsCount.textContent = `Найдено чатов: ${filtered.length}`;
+    }
+    
+    // Удаляем старые результаты (кроме заголовка)
+    const header = searchResults.querySelector('.search-results-header');
+    const items = searchResults.querySelectorAll('.search-result-item');
+    items.forEach(item => item.remove());
+    
+    // Перерисовываем результаты
+    renderResultsList(filtered);
+  }
+  
+  // Функция для отрисовки списка результатов
+  function renderResultsList(resultsToRender) {
+    for (let i = 0; i < resultsToRender.length; i++) {
+    const result = resultsToRender[i];
     const chatId = result.chatId || i;
     const item = document.createElement('div');
     item.className = 'search-result-item';
@@ -2698,18 +2848,33 @@ function displaySearchResults(results) {
     title.style.marginBottom = '0';
     title.style.flex = '1';
     title.style.minWidth = '0';
-    title.textContent = result.title || 'Без названия';
     title.style.textDecoration = 'underline';
     title.style.color = '#1a66d4';
     title.style.cursor = 'pointer';
     
-    // Применяем пастельный фон к заголовку, если аккаунтов больше 1
-    if (uniqueAccounts.size > 1 && result.accountEmail && accountColorMap.has(result.accountEmail)) {
-      const accountColor = accountColorMap.get(result.accountEmail);
-      title.style.backgroundColor = accountColor;
-      title.style.padding = '2px 6px';
-      title.style.borderRadius = '4px';
-      title.style.display = 'inline-block';
+    // Применяем пастельный фон к тексту заголовка (Text Highlight Color), если аккаунтов больше 1
+    const titleText = result.title || 'Без названия';
+    if (currentUniqueAccounts.size > 1 && result.accountEmail && currentAccountColorMap.has(result.accountEmail)) {
+      const accountColor = currentAccountColorMap.get(result.accountEmail);
+      // Обертываем каждый символ (включая пробелы) в span с пастельным фоном
+      const titleSpans = Array.from(titleText).map(char => {
+        const span = document.createElement('span');
+        span.style.backgroundColor = accountColor;
+        span.style.padding = '0 1px';
+        span.style.borderRadius = '2px';
+        span.style.display = 'inline-block';
+        // Для пробелов используем неразрывный пробел и минимальную ширину, чтобы фон был виден
+        if (char === ' ') {
+          span.innerHTML = '&nbsp;';
+          span.style.minWidth = '0.3em';
+        } else {
+          span.textContent = char;
+        }
+        return span;
+      });
+      titleSpans.forEach(span => title.appendChild(span));
+    } else {
+      title.textContent = titleText;
     }
     
     title.addEventListener('click', (e) => {
@@ -2813,7 +2978,11 @@ function displaySearchResults(results) {
     item.appendChild(titleRow);
     item.appendChild(chatContent);
     searchResults.appendChild(item);
+    }
   }
+  
+  // Вызываем функцию отрисовки результатов
+  renderResultsList(filteredResults);
   
   // Функция для обновления состояния кнопки "Свернуть все"
   function updateToggleAllButton() {
