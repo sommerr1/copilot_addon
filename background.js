@@ -5366,6 +5366,52 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
   
+  if (request.type === 'CLEAR_INDEX_CACHE') {
+    console.log('Clear cache: Request received');
+    
+    try {
+      // Check if indexCache exists
+      if (typeof indexCache === 'undefined' || !indexCache) {
+        console.error('Clear cache: indexCache is not defined');
+        throw new Error('indexCache is not defined');
+      }
+      
+      const cacheSize = indexCache.size || 0;
+      const cachedAccounts = cacheSize > 0 ? Array.from(indexCache.keys()) : [];
+      
+      console.log(`Clear cache: Found ${cacheSize} cached index(es)`);
+      
+      // Clear all cached indexes
+      indexCache.clear();
+      
+      console.log(`Clear cache: Cleared ${cacheSize} index(es) from cache`);
+      if (cachedAccounts.length > 0) {
+        console.log(`Clear cache: Cleared indexes for accounts: ${cachedAccounts.join(', ')}`);
+      }
+      
+      const response = { 
+        success: true, 
+        clearedCount: cacheSize,
+        accounts: cachedAccounts
+      };
+      
+      console.log('Clear cache: Sending success response', response);
+      sendResponse(response);
+    } catch (error) {
+      console.error('Clear cache error:', error);
+      console.error('Clear cache error stack:', error.stack);
+      const errorMessage = error?.message || error?.toString() || 'Unknown error';
+      const errorResponse = { 
+        success: false, 
+        error: errorMessage 
+      };
+      console.log('Clear cache: Sending error response', errorResponse);
+      sendResponse(errorResponse);
+    }
+    
+    return true;
+  }
+  
   return false;
 });
 

@@ -432,6 +432,34 @@ if (refreshExtensionBtn) {
   });
 }
 
+// Clear cache button
+const clearCacheBtn = document.getElementById('clearCacheBtn');
+if (clearCacheBtn) {
+  clearCacheBtn.addEventListener('click', async () => {
+    if (confirm('⚠️ Очистить кэш индекса?\n\nИндекс будет перезагружен из БД при следующем поиске. Это может замедлить первый поиск после очистки.')) {
+      try {
+        const response = await chrome.runtime.sendMessage({ type: 'CLEAR_INDEX_CACHE' });
+        
+        // Check for Chrome runtime errors
+        if (chrome.runtime.lastError) {
+          setStatus(`Ошибка очистки кэша: ${chrome.runtime.lastError.message}`, true);
+          return;
+        }
+        
+        if (response && response.success) {
+          const count = response.clearedCount || 0;
+          setStatus(`Кэш индекса очищен (${count} индекс(ов))`, false);
+        } else {
+          const errorMsg = response?.error || 'Неизвестная ошибка';
+          setStatus(`Ошибка очистки кэша: ${errorMsg}`, true);
+        }
+      } catch (error) {
+        setStatus(`Ошибка очистки кэша: ${error.message || 'Неизвестная ошибка'}`, true);
+      }
+    }
+  });
+}
+
 // Initialize - determine which tab to show
 async function init() {
   currentAccountEmail = await getAccountEmail();

@@ -73,6 +73,42 @@ body {
   display: block;
 }
 
+.toolbar__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.toolbar__action-btn {
+  border: none;
+  background: transparent;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #666;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+
+.toolbar__action-btn:hover {
+  background: #e8e8e8;
+  color: #d32f2f;
+}
+
+.toolbar__action-btn:active {
+  transform: scale(0.95);
+  transition: transform 0.1s ease;
+}
+
+.toolbar__action-btn svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
 .requests {
   max-height: 240px;
   overflow: auto;
