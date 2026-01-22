@@ -4597,9 +4597,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           return;
         }
         
-        // Ищем во всех индексах аккаунтов
+        // Разбиваем запрос на слова для поиска пересечений
+        // Создаем временный индекс для токенизации
+        const tempIndex = new SimpleSearchIndex();
+        const queryTerms = tempIndex.tokenize(query);
+        
+        // Если запрос слишком короткий (меньше 2 символов после токенизации), возвращаем пустой результат
+        if (queryTerms.length === 0) {
+          sendResponse({ success: true, results: [] });
+          return;
+        }
+        
+        // Ищем во всех индексах аккаунтов с использованием пересечений
         const allResults = [];
-        const accountIndexMap = new Map(); // Для отслеживания, какой аккаунт соответствует какому индексу
         
         for (const account of allAccounts) {
           const email = account.email;
@@ -4627,7 +4637,55 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               continue;
             }
             
-            const results = index.search(query, { limit: 1000, enrich: true });
+            // Если запрос состоит из одного слова, используем обычный поиск с оригинальным запросом
+            // (чтобы сохранить частичное совпадение)
+            // Если из нескольких - ищем пересечение результатов
+            let results = [];
+            
+            if (queryTerms.length === 1) {
+              // Одно слово - используем оригинальный запрос для сохранения частичного совпадения
+              results = index.search(query, { limit: 1000, enrich: true });
+            } else {
+              // Несколько слов - ищем пересечение
+              // Выполняем поиск по каждому слову отдельно
+              const resultsByTerm = [];
+              for (const term of queryTerms) {
+                const termResults = index.search(term, { limit: 1000, enrich: false }); // enrich: false для скорости
+                resultsByTerm.push(new Set(termResults)); // Преобразуем в Set для быстрого пересечения
+              }
+              
+              // Находим пересечение всех результатов
+              // Начинаем с первого множества и последовательно пересекаем с остальными
+              let intersection = resultsByTerm[0];
+              for (let i = 1; i < resultsByTerm.length; i++) {
+                const newIntersection = new Set();
+                for (const docId of intersection) {
+                  if (resultsByTerm[i].has(docId)) {
+                    newIntersection.add(docId);
+                  }
+                }
+                intersection = newIntersection;
+                
+                // Если пересечение пустое, дальше искать не нужно
+                if (intersection.size === 0) {
+                  break;
+                }
+              }
+              
+              // Получаем полные документы для результатов пересечения
+              for (const docId of intersection) {
+                const doc = index.get(docId);
+                if (doc) {
+                  results.push(doc);
+                }
+              }
+              
+              // Сортируем результаты по релевантности (можно улучшить, используя score из поиска)
+              // Пока просто ограничиваем количество
+              if (results.length > 1000) {
+                results = results.slice(0, 1000);
+              }
+            }
             
             // Сохраняем связь между результатами и аккаунтом
             for (const result of results) {

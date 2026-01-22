@@ -63,6 +63,10 @@ const indexProgress = document.getElementById('indexProgress');
 const searchInput = document.getElementById('searchInput');
 const searchResults = document.getElementById('searchResults');
 const searchEmpty = document.getElementById('searchEmpty');
+const searchHistoryDropdown = document.getElementById('searchHistoryDropdown');
+const searchClearBtn = document.getElementById('searchClearBtn');
+let searchHistory = []; // История поисковых запросов
+const MAX_SEARCH_HISTORY = 20; // Максимальное количество записей в истории
 const statusEl = document.getElementById('status');
 const diagnosticsBtn = document.getElementById('diagnosticsBtn');
 const diagnosticsInfo = document.getElementById('diagnosticsInfo');
@@ -464,6 +468,9 @@ if (clearCacheBtn) {
 async function init() {
   currentAccountEmail = await getAccountEmail();
   await checkIndexingState();
+  
+  // Загружаем историю поиска
+  await loadSearchHistory();
   
   if (!currentAccountEmail) {
     setStatus('Откройте страницу Copilot для определения аккаунта', true);
@@ -3228,6 +3235,164 @@ async function performReset(accountEmail) {
   }
 }
 
+// Search History Functions
+async function loadSearchHistory() {
+  try {
+    const result = await chrome.storage.local.get(['searchHistory']);
+    searchHistory = result.searchHistory || [];
+  } catch (error) {
+    console.error('Error loading search history:', error);
+    searchHistory = [];
+  }
+}
+
+async function saveSearchHistory() {
+  try {
+    await chrome.storage.local.set({ searchHistory });
+  } catch (error) {
+    console.error('Error saving search history:', error);
+  }
+}
+
+function addToSearchHistory(query) {
+  if (!query || query.trim().length < 2) return;
+  
+  const trimmedQuery = query.trim();
+  
+  // Удаляем дубликаты
+  searchHistory = searchHistory.filter(q => q.toLowerCase() !== trimmedQuery.toLowerCase());
+  
+  // Добавляем в начало
+  searchHistory.unshift(trimmedQuery);
+  
+  // Ограничиваем размер истории
+  if (searchHistory.length > MAX_SEARCH_HISTORY) {
+    searchHistory = searchHistory.slice(0, MAX_SEARCH_HISTORY);
+  }
+  
+  saveSearchHistory();
+}
+
+function filterSearchHistory(query) {
+  if (!query || query.trim().length === 0) {
+    return searchHistory.slice(0, 10); // Показываем последние 10 при пустом запросе
+  }
+  
+  const lowerQuery = query.toLowerCase();
+  return searchHistory
+    .filter(item => item.toLowerCase().includes(lowerQuery))
+    .slice(0, 10); // Максимум 10 результатов
+}
+
+function showSearchHistoryDropdown(query = '') {
+  if (!searchHistoryDropdown) return;
+  
+  const filtered = filterSearchHistory(query);
+  
+  if (filtered.length === 0) {
+    searchHistoryDropdown.classList.add('hidden');
+    return;
+  }
+  
+  searchHistoryDropdown.innerHTML = '';
+  searchHistoryDropdown.classList.remove('hidden');
+  
+  filtered.forEach((item, index) => {
+    const itemEl = document.createElement('div');
+    itemEl.className = 'search-history-item';
+    itemEl.setAttribute('data-query', item);
+    itemEl.setAttribute('tabindex', '0'); // Для навигации с клавиатуры
+    
+    // Выделяем совпадающую часть
+    if (query.trim().length > 0) {
+      const lowerItem = item.toLowerCase();
+      const lowerQuery = query.toLowerCase();
+      const matchIndex = lowerItem.indexOf(lowerQuery);
+      
+      if (matchIndex !== -1) {
+        const before = item.substring(0, matchIndex);
+        const match = item.substring(matchIndex, matchIndex + query.length);
+        const after = item.substring(matchIndex + query.length);
+        
+        itemEl.innerHTML = `${escapeHtml(before)}<strong>${escapeHtml(match)}</strong>${escapeHtml(after)}`;
+      } else {
+        itemEl.textContent = item;
+      }
+    } else {
+      itemEl.textContent = item;
+    }
+    
+    const selectItem = () => {
+      searchInput.value = item;
+      searchHistoryDropdown.classList.add('hidden');
+      performSearch(item);
+      addToSearchHistory(item); // Обновляем позицию в истории
+    };
+    
+    itemEl.addEventListener('click', selectItem);
+    itemEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        selectItem();
+      }
+    });
+    
+    // Добавляем иконку удаления
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'search-history-delete';
+    deleteBtn.innerHTML = '×';
+    deleteBtn.setAttribute('aria-label', 'Удалить из истории');
+    deleteBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      searchHistory = searchHistory.filter(q => q !== item);
+      saveSearchHistory();
+      showSearchHistoryDropdown(query);
+    });
+    
+    itemEl.appendChild(deleteBtn);
+    searchHistoryDropdown.appendChild(itemEl);
+  });
+}
+
+function hideSearchHistoryDropdown() {
+  if (searchHistoryDropdown) {
+    searchHistoryDropdown.classList.add('hidden');
+  }
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function updateClearButton() {
+  if (!searchClearBtn || !searchInput) return;
+  
+  if (searchInput.value.trim().length > 0) {
+    searchClearBtn.classList.remove('hidden');
+  } else {
+    searchClearBtn.classList.add('hidden');
+  }
+}
+
+function clearSearchInput() {
+  if (!searchInput) return;
+  
+  searchInput.value = '';
+  searchInput.focus();
+  updateClearButton();
+  hideSearchHistoryDropdown();
+  searchResults.innerHTML = '';
+  searchEmpty.style.display = 'block';
+  
+  // Останавливаем таймер поиска, если он активен
+  if (searchTimeout) {
+    clearTimeout(searchTimeout);
+    searchTimeout = null;
+  }
+}
+
 // Search
 function performSearch(query) {
   // Убираем проверку currentAccountEmail - теперь поиск работает по всем аккаунтам
@@ -3912,18 +4077,133 @@ function displaySearchResults(results) {
 }
 
 if (searchInput) {
+  // Обработчик ввода текста - показываем историю и выполняем поиск
   searchInput.addEventListener('input', (e) => {
-    const query = e.target.value.trim();
+    const query = e.target.value;
     
+    // Обновляем видимость кнопки очистки
+    updateClearButton();
+    
+    // Показываем историю поиска при вводе (только если поле в фокусе)
+    if (document.activeElement === searchInput) {
+      if (query.length > 0) {
+        showSearchHistoryDropdown(query);
+      } else {
+        showSearchHistoryDropdown(''); // Показываем последние запросы при пустом поле
+      }
+    }
+    
+    // Выполняем поиск с задержкой
     if (searchTimeout) {
       clearTimeout(searchTimeout);
     }
     
     searchTimeout = setTimeout(() => {
-      performSearch(query);
+      const trimmedQuery = query.trim();
+      if (trimmedQuery.length >= 2) {
+        performSearch(trimmedQuery);
+      } else {
+        searchResults.innerHTML = '';
+        searchEmpty.style.display = 'block';
+      }
     }, 300);
   });
+  
+  // Обработчик нажатия Enter - сохраняем в историю и выполняем поиск
+  searchInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const query = searchInput.value.trim();
+      
+      // Скрываем выпадающий список
+      hideSearchHistoryDropdown();
+      
+      if (query.length >= 2) {
+        // Сохраняем в историю только при нажатии Enter
+        addToSearchHistory(query);
+        performSearch(query);
+      }
+    } else if (e.key === 'Escape') {
+      // Скрываем выпадающий список при Escape
+      hideSearchHistoryDropdown();
+      searchInput.blur();
+    } else if (e.key === 'ArrowDown') {
+      // Навигация по истории стрелками
+      e.preventDefault();
+      const items = searchHistoryDropdown.querySelectorAll('.search-history-item');
+      if (items.length > 0) {
+        const firstItem = items[0];
+        firstItem.focus();
+        firstItem.classList.add('highlighted');
+      }
+    }
+  });
+  
+  // Обработчик фокуса - показываем историю
+  searchInput.addEventListener('focus', () => {
+    if (searchInput.value.length === 0) {
+      showSearchHistoryDropdown('');
+    } else {
+      showSearchHistoryDropdown(searchInput.value);
+    }
+  });
+  
+  // Обработчик клика вне поля - скрываем историю
+  document.addEventListener('click', (e) => {
+    const searchInputWrapper = searchInput.closest('.search-input-wrapper');
+    if (searchInputWrapper && !searchInputWrapper.contains(e.target)) {
+      hideSearchHistoryDropdown();
+    }
+  });
+  
+  // Инициализация кнопки очистки
+  updateClearButton();
 }
+
+// Обработчик клика для кнопки очистки
+if (searchClearBtn) {
+  searchClearBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    clearSearchInput();
+  });
+}
+  
+  // Навигация по истории с клавиатуры
+  if (searchHistoryDropdown) {
+    searchHistoryDropdown.addEventListener('keydown', (e) => {
+      const items = Array.from(searchHistoryDropdown.querySelectorAll('.search-history-item'));
+      const highlighted = searchHistoryDropdown.querySelector('.search-history-item.highlighted');
+      let currentIndex = highlighted ? items.indexOf(highlighted) : -1;
+      
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (highlighted) highlighted.classList.remove('highlighted');
+        currentIndex = (currentIndex + 1) % items.length;
+        items[currentIndex].classList.add('highlighted');
+        items[currentIndex].focus();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (highlighted) highlighted.classList.remove('highlighted');
+        currentIndex = currentIndex <= 0 ? items.length - 1 : currentIndex - 1;
+        items[currentIndex].classList.add('highlighted');
+        items[currentIndex].focus();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (highlighted) {
+          const query = highlighted.getAttribute('data-query');
+          searchInput.value = query;
+          hideSearchHistoryDropdown();
+          addToSearchHistory(query);
+          performSearch(query);
+        }
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        hideSearchHistoryDropdown();
+        searchInput.focus();
+      }
+    });
+  }
 
 // Initialize on load
 // Wait for DOM to be ready

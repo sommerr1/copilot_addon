@@ -125,7 +125,11 @@
     <!-- Search Tab -->
     <div id="tabContentSearch" class="tab-content">
       <div class="search-section">
-        <input type="text" id="searchInput" class="search-input" placeholder="Введите минимум 2 символа для поиска..." />
+        <div class="search-input-wrapper">
+          <input type="text" id="searchInput" class="search-input" placeholder="Введите минимум 2 символа для поиска..." autocomplete="off" />
+          <button id="searchClearBtn" class="search-clear-btn hidden" title="Очистить поиск" aria-label="Очистить поиск">×</button>
+          <div id="searchHistoryDropdown" class="search-history-dropdown hidden"></div>
+        </div>
         <div id="searchResults" class="search-results"></div>
         <div id="searchEmpty" class="empty">Введите запрос для поиска</div>
       </div>

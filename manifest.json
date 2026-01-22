@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Copilot Chat Indexer",
-  "version": "1.01.04",
-  "versiondescription": "Added Markdown export functionality with chat selection, grouping by months, and ZIP archive creation",
+  "version": "1.01.07",
+  "versiondescription": "Added clear button (X) in search input to reset search value",
   "description": "Local indexing and search for Microsoft Copilot chats",
   "permissions": ["tabs", "webRequest", "storage", "debugger", "windows", "scripting", "downloads"],
   "host_permissions": ["*://copilot.microsoft.com/*"],

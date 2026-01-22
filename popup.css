@@ -381,8 +381,13 @@ body {
   min-height: 0;
 }
 
+.search-input-wrapper {
+  position: relative;
+  width: 100%;
+}
+
 .search-input {
-  padding: 10px 12px;
+  padding: 10px 36px 10px 12px; /* Добавлен правый отступ для кнопки очистки */
   border: 1px solid #c7c7c7;
   border-radius: 4px;
   font-size: 13px;
@@ -396,12 +401,147 @@ body {
   box-shadow: 0 0 0 2px rgba(26, 102, 212, 0.1);
 }
 
+.search-clear-btn {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: #999;
+  font-size: 20px;
+  line-height: 1;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  cursor: pointer;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+  z-index: 10;
+}
+
+.search-clear-btn.hidden {
+  display: none;
+}
+
+.search-clear-btn:hover {
+  background-color: #f0f0f0;
+  color: #666;
+}
+
+.search-clear-btn:active {
+  background-color: #e0e0e0;
+}
+
+.search-history-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  width: 66.67%; /* Уменьшено на одну треть (2/3 от исходной ширины) */
+  margin-top: 4px;
+  background: #fff;
+  border: 1px solid #c7c7c7;
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  height: 210px; /* Фиксированная высота, уменьшено на 30% (70% от исходной высоты 300px) */
+  max-height: 210px;
+  overflow-y: auto;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+}
+
+.search-history-dropdown.hidden {
+  display: none;
+}
+
+.search-history-item {
+  padding: 7px 12px; /* Уменьшено на 30% (было 10px, стало 7px) */
+  font-size: 13px;
+  color: #333;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  transition: background-color 0.15s;
+  border-bottom: 1px solid #f0f0f0;
+  position: relative;
+}
+
+.search-history-item:last-child {
+  border-bottom: none;
+}
+
+.search-history-item:hover,
+.search-history-item.highlighted {
+  background-color: #f5f5f5;
+}
+
+.search-history-item:active {
+  background-color: #e8e8e8;
+}
+
+.search-history-item strong {
+  color: #1a66d4;
+  font-weight: 600;
+}
+
+.search-history-delete {
+  background: transparent;
+  border: none;
+  color: #999;
+  font-size: 18px;
+  line-height: 1;
+  padding: 4px 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  transition: all 0.15s;
+  flex-shrink: 0;
+  opacity: 0;
+}
+
+.search-history-item:hover .search-history-delete {
+  opacity: 1;
+}
+
+.search-history-delete:hover {
+  background-color: #f0f0f0;
+  color: #d32f2f;
+}
+
+.search-history-delete:active {
+  background-color: #e0e0e0;
+}
+
+/* Стилизация скроллбара для истории поиска */
+.search-history-dropdown::-webkit-scrollbar {
+  width: 8px;
+}
+
+.search-history-dropdown::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 4px;
+}
+
+.search-history-dropdown::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 4px;
+}
+
+.search-history-dropdown::-webkit-scrollbar-thumb:hover {
+  background: #a1a1a1;
+}
+
 .search-results {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  flex: 1;
+  flex: 1; /* Заполняет всё доступное пространство до низа попапа */
   min-height: 0;
+  width: 100%; /* Ширина на весь попап */
   overflow-y: auto;
   overflow-x: hidden;
   padding-right: 4px;
